@@ -239,6 +239,29 @@ public:
     bool run();
 
     /**
+     * @brief Configure local device UUID for outgoing offers (v0.2.0+)
+     *
+     * Must be set before run(). If empty, offers will omit sender UUID.
+     */
+    void setLocalDeviceUuid(const std::string& uuid) { m_localDeviceUuid = uuid; }
+
+    /**
+     * @brief Configure peer UUID and pinned fingerprint for outgoing verification (v0.2.0+)
+     *
+     * Must be set before run() to enforce pinning. If expected fingerprint is empty,
+     * the session will refuse to transfer when TLS is required.
+     */
+    void setPeerIdentity(const std::string& peerUuid, const std::string& expectedFingerprintSha256Hex) {
+        m_peerUuid = peerUuid;
+        m_expectedPeerFingerprintSha256Hex = expectedFingerprintSha256Hex;
+    }
+
+    /**
+     * @brief Require TLS for transfers (default true for v0.2.0+)
+     */
+    void setRequireTls(bool requireTls) { m_requireTls = requireTls; }
+
+    /**
      * @brief Cancel the transfer session
      *
      * Signals the session to cancel. If the transfer is in progress,
@@ -259,7 +282,7 @@ public:
      * It must be called directly with the socket parameter, as INCOMING
      * sessions don't store the socket (it's moved from accept()).
      */
-    bool runIncomingTransfer(SOCKET socket, const ExoHeader& preReceivedHeader, std::string& errorMsg);
+    bool runIncomingTransfer(TransportStream& stream, const ExoHeader& preReceivedHeader, std::string& errorMsg);
 
     //=========================================================================
     // Status Query Methods
@@ -394,6 +417,10 @@ private:
     std::string m_downloadDir;         ///< Download directory (incoming only)
     std::string m_peerIpAddress;       ///< Peer IP address
     uint16_t m_peerPort;               ///< Peer TCP port
+    std::string m_peerUuid;            ///< Peer UUID (outgoing pinning and UX)
+    std::string m_expectedPeerFingerprintSha256Hex; ///< Pinned peer fingerprint (SHA-256 hex)
+    std::string m_localDeviceUuid;     ///< Local device UUID (outgoing offers)
+    bool m_requireTls = true;          ///< Enforce TLS by default (v0.2.0+)
 
     // Progress tracking
     std::atomic<uint64_t> m_bytesTransferred;  ///< Bytes transferred

@@ -352,6 +352,15 @@ TEST_F(ExoHeaderTest, GetPacketTypeReturnsCorrectEnum) {
 
     ExoHeader busyHeader(PacketType::BUSY, 100, "test.txt");
     EXPECT_EQ(busyHeader.getPacketType(), PacketType::BUSY);
+
+    ExoHeader hashHeader(PacketType::HASH, 0, "");
+    EXPECT_EQ(hashHeader.getPacketType(), PacketType::HASH);
+
+    ExoHeader hashOkHeader(PacketType::HASH_OK, 0, "");
+    EXPECT_EQ(hashOkHeader.getPacketType(), PacketType::HASH_OK);
+
+    ExoHeader hashBadHeader(PacketType::HASH_BAD, 0, "");
+    EXPECT_EQ(hashBadHeader.getPacketType(), PacketType::HASH_BAD);
 }
 
 /**
@@ -371,6 +380,15 @@ TEST_F(ExoHeaderTest, GetPacketTypeStringReturnsCorrectStrings) {
 
     header.packetType = static_cast<uint8_t>(PacketType::BUSY);
     EXPECT_EQ(header.getPacketTypeString(), "BUSY");
+
+    header.packetType = static_cast<uint8_t>(PacketType::HASH);
+    EXPECT_EQ(header.getPacketTypeString(), "HASH");
+
+    header.packetType = static_cast<uint8_t>(PacketType::HASH_OK);
+    EXPECT_EQ(header.getPacketTypeString(), "HASH_OK");
+
+    header.packetType = static_cast<uint8_t>(PacketType::HASH_BAD);
+    EXPECT_EQ(header.getPacketTypeString(), "HASH_BAD");
 }
 
 //=============================================================================

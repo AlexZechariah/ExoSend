@@ -96,6 +96,22 @@ public:
     void setTcpPort(uint16_t port);
 
     /**
+     * @brief Set the device UUID used for beaconing
+     *
+     * Must be called before start(). The UUID should be stable across restarts.
+     */
+    void setDeviceUuid(const std::string& uuid);
+
+    /**
+     * @brief Set the certificate fingerprint (SHA-256 hex) for UX pairing support.
+     *
+     * This is included in discovery beacons for convenience only. Discovery
+     * beacons remain untrusted routing hints and must not be used as the
+     * authentication source of truth.
+     */
+    void setCertificateFingerprintSha256Hex(const std::string& fingerprintSha256Hex);
+
+    /**
      * @brief Get the display name
      * @return Current display name
      */
@@ -106,6 +122,7 @@ public:
      * @return UUID string
      */
     const std::string& getUuid() const { return m_uuid; }
+    const std::string& getCertificateFingerprintSha256Hex() const { return m_certFingerprintSha256Hex; }
 
     /**
      * @brief Get the TCP port
@@ -206,6 +223,7 @@ private:
     std::string m_displayName;     ///< Human-readable name
     std::string m_uuid;            ///< Unique device identifier
     uint16_t m_tcpPort;            ///< TCP port for transfers
+    std::string m_certFingerprintSha256Hex; ///< Certificate fingerprint (SHA-256 hex)
 
     // Socket handle (SOCKET from winsock2.h)
     SOCKET m_udpSocket;

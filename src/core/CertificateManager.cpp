@@ -4,6 +4,7 @@
  */
 
 #include "exosend/CertificateManager.h"
+#include "exosend/FingerprintUtils.h"
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/pem.h>
@@ -19,6 +20,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <cstdlib>
 
 // Windows headers for path functions
 #ifdef _WIN32
@@ -41,6 +43,23 @@ namespace ExoSend {
 //=============================================================================
 
 std::string CertificateManager::getDefaultCertDir() {
+#ifdef _WIN32
+    {
+        DWORD required = GetEnvironmentVariableA("EXOSEND_CERT_DIR", nullptr, 0);
+        if (required > 1) {
+            std::string certDir;
+            certDir.resize(required - 1);
+            DWORD written = GetEnvironmentVariableA("EXOSEND_CERT_DIR", certDir.data(), required);
+            if (written > 0) {
+                for (char& c : certDir) {
+                    if (c == '\\') c = '/';
+                }
+                return certDir;
+            }
+        }
+    }
+#endif
+
 #ifdef _WIN32
     // Get %APPDATA% path
     char appDataPath[MAX_PATH];
@@ -337,7 +356,7 @@ bool CertificateManager::loadCertificate(SSL_CTX* ctx,
 //=============================================================================
 
 std::string CertificateManager::getCertificateFingerprint(const std::string& certPath,
-                                                         std::string& errorMsg) {
+                                                          std::string& errorMsg) {
     // Read certificate file
     BIO* bio = BIO_new_file(certPath.c_str(), "r");
     if (!bio) {
@@ -368,20 +387,17 @@ std::string CertificateManager::getCertificateFingerprint(const std::string& cer
     SHA256(der, static_cast<size_t>(derLen), hash);
     OPENSSL_free(der);
 
-    // Convert to hex string with colons
+    // Convert to canonical hex string (64 uppercase hex, no separators)
     std::string fingerprint;
-    fingerprint.reserve(SHA256_DIGEST_LENGTH * 3 - 1);
+    fingerprint.reserve(SHA256_DIGEST_LENGTH * 2);
     for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
-        char buf[4];
+        char buf[3];
         snprintf(buf, sizeof(buf), "%02X", hash[i]);
         fingerprint += buf;
-
-        if (i < SHA256_DIGEST_LENGTH - 1) {
-            fingerprint += ":";
-        }
     }
 
-    return fingerprint;
+    // Defensive: ensure canonical form even if formatting changes later.
+    return FingerprintUtils::normalizeSha256Hex(fingerprint);
 }
 
 std::string CertificateManager::getCertificateCommonName(const std::string& certPath,

@@ -7,7 +7,7 @@
 
 ; Application Information
 AppName=ExoSend
-AppVersion=0.1.0
+AppVersion=0.2.0
 AppPublisher=ExoSend Project
 AppPublisherURL=https://github.com/yourusername/exosend
 AppSupportURL=https://github.com/yourusername/exosend/issues
@@ -42,7 +42,7 @@ PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 
 ; Build Information
-VersionInfoVersion=0.1.0.0
+VersionInfoVersion=0.2.0.0
 VersionInfoCompany=ExoSend Project
 VersionInfoDescription=ExoSend
 VersionInfoCopyright=Copyright (C) 2026
@@ -141,7 +141,7 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 ; Application Settings (Store installation path)
 Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "Version"; ValueData: "0.1.0"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "Version"; ValueData: "0.2.0"; Flags: uninsdeletekey
 
 [Dirs]
 ; Create required directories (these should already exist from Files section, but ensuring them)

@@ -5,6 +5,7 @@
 
 #include "exosend/FileTransfer.h"
 #include "exosend/TlsSocket.h"
+#include "exosend/TransportStream.h"
 
 #include <fstream>
 #include <filesystem>
@@ -21,6 +22,34 @@
 #endif
 
 namespace ExoSend {
+
+//=============================================================================
+// TransportStream Implementations
+//=============================================================================
+
+bool PlainSocketStream::sendExact(const uint8_t* data, size_t size, std::string& errorMsg) {
+    return ExoSend::sendExact(m_socket, data, size, errorMsg);
+}
+
+bool PlainSocketStream::recvExact(uint8_t* buffer, size_t size, std::string& errorMsg) {
+    return ExoSend::recvExact(m_socket, buffer, size, errorMsg);
+}
+
+bool TlsTransportStream::sendExact(const uint8_t* data, size_t size, std::string& errorMsg) {
+    return ExoSend::sendExact(m_tls, data, size, errorMsg);
+}
+
+bool TlsTransportStream::recvExact(uint8_t* buffer, size_t size, std::string& errorMsg) {
+    return ExoSend::recvExact(m_tls, buffer, size, errorMsg);
+}
+
+void TlsTransportStream::shutdown() {
+    m_tls.shutdown();
+}
+
+std::string TlsTransportStream::getPeerFingerprint(std::string& errorMsg) {
+    return m_tls.getPeerFingerprint(errorMsg);
+}
 
 //=============================================================================
 // Utility Functions
@@ -124,8 +153,9 @@ bool recvExact(SOCKET socket, uint8_t* buffer, size_t size,
 // FileSender Implementation
 //=============================================================================
 
-FileSender::FileSender(const std::string& filePath)
+FileSender::FileSender(const std::string& filePath, const std::string& senderUuid)
     : m_filePath(filePath)
+    , m_senderUuid(senderUuid)
     , m_fileSize(0)
     , m_hashComputed(false)
 {
@@ -136,19 +166,27 @@ bool FileSender::sendFile(SOCKET socket,
                            std::string& errorMsg,
                            ProgressCallback progress)
 {
+    PlainSocketStream stream(socket);
+    return sendFile(stream, errorMsg, progress);
+}
+
+bool FileSender::sendFile(TransportStream& stream,
+                           std::string& errorMsg,
+                           ProgressCallback progress)
+{
     // Step 1: Initialize (validate file, get size)
     if (!initialize(errorMsg)) {
         return false;
     }
 
     // Step 2: Send offer header
-    if (!sendOfferHeader(socket, errorMsg)) {
+    if (!sendOfferHeader(stream, errorMsg)) {
         return false;
     }
 
     // Step 3: Wait for response
     PacketType response;
-    if (!waitForResponse(socket, response, errorMsg)) {
+    if (!waitForResponse(stream, response, errorMsg)) {
         return false;
     }
 
@@ -170,7 +208,7 @@ bool FileSender::sendFile(SOCKET socket,
     }
 
     // Step 5: Send file data
-    if (!sendFileData(socket, errorMsg, progress)) {
+    if (!sendFileData(stream, errorMsg, progress)) {
         return false;
     }
 
@@ -178,7 +216,41 @@ bool FileSender::sendFile(SOCKET socket,
     m_sha256HashString = HashUtils::hashToString(m_sha256Hash);
     m_hashComputed = true;
 
-    return true;
+    // Step 6: Send final hash and require explicit receiver verification (v0.2.0+)
+    {
+        ExoHeader hashHeader(PacketType::HASH, 0, "");
+        hashHeader.setSha256Bytes(m_sha256Hash);
+
+        std::vector<uint8_t> hashBuffer(HEADER_SIZE);
+        if (!hashHeader.serializeToBuffer(hashBuffer.data())) {
+            errorMsg = "Failed to serialize hash header";
+            return false;
+        }
+
+        if (!stream.sendExact(hashBuffer.data(), HEADER_SIZE, errorMsg)) {
+            errorMsg = "Failed to send hash header: " + errorMsg;
+            return false;
+        }
+
+        PacketType verifyResponse;
+        if (!waitForResponse(stream, verifyResponse, errorMsg)) {
+            errorMsg = "Failed to receive hash verification response: " + errorMsg;
+            return false;
+        }
+
+        if (verifyResponse == PacketType::HASH_OK) {
+            return true;
+        }
+
+        if (verifyResponse == PacketType::HASH_BAD) {
+            errorMsg = "Receiver reported SHA-256 mismatch";
+            return false;
+        }
+
+        errorMsg = "Unexpected hash verification response: " +
+                   std::to_string(static_cast<int>(verifyResponse));
+        return false;
+    }
 }
 
 bool FileSender::initialize(std::string& errorMsg)
@@ -236,10 +308,13 @@ bool FileSender::initialize(std::string& errorMsg)
     }
 }
 
-bool FileSender::sendOfferHeader(SOCKET socket, std::string& errorMsg)
+bool FileSender::sendOfferHeader(TransportStream& stream, std::string& errorMsg)
 {
     // Create offer header
     ExoHeader offer(PacketType::OFFER, m_fileSize, m_fileName);
+    if (!m_senderUuid.empty()) {
+        offer.setSenderUuid(m_senderUuid);
+    }
 
     // Validate header
     if (!offer.isValid()) {
@@ -255,7 +330,7 @@ bool FileSender::sendOfferHeader(SOCKET socket, std::string& errorMsg)
     }
 
     // Send header
-    if (!sendExact(socket, buffer.data(), HEADER_SIZE, errorMsg)) {
+    if (!stream.sendExact(buffer.data(), HEADER_SIZE, errorMsg)) {
         errorMsg = "Failed to send offer header: " + errorMsg;
         return false;
     }
@@ -263,12 +338,12 @@ bool FileSender::sendOfferHeader(SOCKET socket, std::string& errorMsg)
     return true;
 }
 
-bool FileSender::waitForResponse(SOCKET socket, PacketType& response,
+bool FileSender::waitForResponse(TransportStream& stream, PacketType& response,
                                   std::string& errorMsg)
 {
     // Receive response header
     std::vector<uint8_t> buffer(HEADER_SIZE);
-    if (!recvExact(socket, buffer.data(), HEADER_SIZE, errorMsg)) {
+    if (!stream.recvExact(buffer.data(), HEADER_SIZE, errorMsg)) {
         errorMsg = "Failed to receive response header: " + errorMsg;
         return false;
     }
@@ -290,7 +365,7 @@ bool FileSender::waitForResponse(SOCKET socket, PacketType& response,
     return true;
 }
 
-bool FileSender::sendFileData(SOCKET socket, std::string& errorMsg,
+bool FileSender::sendFileData(TransportStream& stream, std::string& errorMsg,
                                ProgressCallback progress)
 {
     // Open file for reading
@@ -300,10 +375,13 @@ bool FileSender::sendFileData(SOCKET socket, std::string& errorMsg,
         return false;
     }
 
+    // Increase file stream buffering for large sequential reads
+    std::vector<char> fileIoBuffer(1024 * 1024);
+    (void)file.rdbuf()->pubsetbuf(fileIoBuffer.data(), static_cast<std::streamsize>(fileIoBuffer.size()));
+
     // Allocate buffer
     std::vector<uint8_t> buffer(BUFFER_SIZE);
     uint64_t totalSent = 0;
-    int retryCount = 0;
 
     while (file) {
         // Read chunk from file
@@ -314,25 +392,10 @@ bool FileSender::sendFileData(SOCKET socket, std::string& errorMsg,
             break;  // EOF or error
         }
 
-        // Send chunk
-        size_t chunkSent = 0;
-        while (chunkSent < static_cast<size_t>(bytesRead)) {
-            int sendResult = send(socket,
-                                  reinterpret_cast<const char*>(buffer.data() + chunkSent),
-                                  static_cast<int>(bytesRead - chunkSent),
-                                  0);
-
-            if (sendResult == SOCKET_ERROR) {
-                errorMsg = "send() failed: " + std::to_string(WSAGetLastError());
-                return false;
-            }
-
-            if (sendResult == 0) {
-                errorMsg = "Connection closed by peer";
-                return false;
-            }
-
-            chunkSent += static_cast<size_t>(sendResult);
+        // Send chunk (exact)
+        if (!stream.sendExact(buffer.data(), static_cast<size_t>(bytesRead), errorMsg)) {
+            errorMsg = "Failed to send file chunk: " + errorMsg;
+            return false;
         }
 
         // Update hash
@@ -349,8 +412,6 @@ bool FileSender::sendFileData(SOCKET socket, std::string& errorMsg,
             progress(totalSent, m_fileSize, percentage);
         }
 
-        // Reset retry count on successful chunk
-        retryCount = 0;
     }
 
     // Check for read errors
@@ -411,9 +472,18 @@ bool FileReceiver::receiveFile(SOCKET socket,
                                 std::function<bool(const ExoHeader&)> acceptCallback,
                                 ProgressCallback progress)
 {
+    PlainSocketStream stream(socket);
+    return receiveFile(stream, errorMsg, acceptCallback, progress);
+}
+
+bool FileReceiver::receiveFile(TransportStream& stream,
+                                std::string& errorMsg,
+                                std::function<bool(const ExoHeader&)> acceptCallback,
+                                ProgressCallback progress)
+{
     // Step 1: Receive offer header
     ExoHeader offer;
-    if (!receiveOfferHeader(socket, offer, errorMsg)) {
+    if (!receiveOfferHeader(stream, offer, errorMsg)) {
         return false;
     }
 
@@ -425,7 +495,7 @@ bool FileReceiver::receiveFile(SOCKET socket,
 
     // Step 3: Send response
     PacketType responseType = accepted ? PacketType::ACCEPT : PacketType::REJECT;
-    if (!sendResponse(socket, responseType, errorMsg)) {
+    if (!sendResponse(stream, responseType, errorMsg)) {
         return false;
     }
 
@@ -437,19 +507,19 @@ bool FileReceiver::receiveFile(SOCKET socket,
     // Step 4: Validate download path for security
     if (!validateDownloadPath(m_downloadDir)) {
         errorMsg = "Invalid download directory path";
-        sendResponse(socket, PacketType::REJECT, errorMsg);
+        sendResponse(stream, PacketType::REJECT, errorMsg);
         return false;
     }
 
     // Step 5: Check disk space
     if (!hasEnoughDiskSpace(offer.fileSize, m_downloadDir)) {
         errorMsg = "Insufficient disk space";
-        sendResponse(socket, PacketType::REJECT, errorMsg);
+        sendResponse(stream, PacketType::REJECT, errorMsg);
         return false;
     }
 
     // Step 6: Receive file data
-    if (!receiveFileData(socket, offer, errorMsg, progress)) {
+    if (!receiveFileData(stream, offer, errorMsg, progress)) {
         return false;
     }
 
@@ -466,10 +536,59 @@ bool FileReceiver::receiveFile(SOCKET socket,
     m_sha256HashString = HashUtils::hashToString(m_sha256Hash);
     m_hashComputed = true;
 
+    // Step 8: Receive sender hash and verify (v0.2.0+)
+    {
+        std::vector<uint8_t> buffer(HEADER_SIZE);
+        if (!stream.recvExact(buffer.data(), HEADER_SIZE, errorMsg)) {
+            errorMsg = "Failed to receive hash header: " + errorMsg;
+            deletePartialFile();
+            return false;
+        }
+
+        ExoHeader hashHeader;
+        if (!hashHeader.deserializeFromBuffer(buffer.data())) {
+            errorMsg = "Failed to deserialize hash header";
+            deletePartialFile();
+            return false;
+        }
+
+        if (!hashHeader.isValid() || hashHeader.getPacketType() != PacketType::HASH) {
+            errorMsg = "Invalid hash header received";
+            deletePartialFile();
+            return false;
+        }
+
+        const auto senderHash = hashHeader.getSha256Bytes();
+        const bool match = HashUtils::compareHashes(
+            reinterpret_cast<const unsigned char*>(senderHash.data()),
+            reinterpret_cast<const unsigned char*>(m_sha256Hash)
+        );
+
+        const PacketType responseType = match ? PacketType::HASH_OK : PacketType::HASH_BAD;
+        std::string responseError;
+        (void)sendResponse(stream, responseType, responseError);
+
+        if (!match) {
+            errorMsg = "SHA-256 mismatch: transfer corrupted or tampered";
+            deletePartialFile();
+            return false;
+        }
+    }
+
     return true;
 }
 
 bool FileReceiver::receiveFile(SOCKET socket,
+                                const ExoHeader& preReceivedHeader,
+                                std::string& errorMsg,
+                                std::function<bool(const ExoHeader&)> acceptCallback,
+                                ProgressCallback progress)
+{
+    PlainSocketStream stream(socket);
+    return receiveFile(stream, preReceivedHeader, errorMsg, acceptCallback, progress);
+}
+
+bool FileReceiver::receiveFile(TransportStream& stream,
                                 const ExoHeader& preReceivedHeader,
                                 std::string& errorMsg,
                                 std::function<bool(const ExoHeader&)> acceptCallback,
@@ -521,7 +640,7 @@ bool FileReceiver::receiveFile(SOCKET socket,
 
     // Step 7: Receive file data
     // Socket is positioned correctly: TransferServer sent ACCEPT, sender is now sending FILE DATA
-    if (!receiveFileData(socket, preReceivedHeader, errorMsg, progress)) {
+    if (!receiveFileData(stream, preReceivedHeader, errorMsg, progress)) {
         return false;
     }
 
@@ -538,15 +657,54 @@ bool FileReceiver::receiveFile(SOCKET socket,
     m_sha256HashString = HashUtils::hashToString(m_sha256Hash);
     m_hashComputed = true;
 
+    // Step 9: Receive sender hash and verify (v0.2.0+)
+    {
+        std::vector<uint8_t> buffer(HEADER_SIZE);
+        if (!stream.recvExact(buffer.data(), HEADER_SIZE, errorMsg)) {
+            errorMsg = "Failed to receive hash header: " + errorMsg;
+            deletePartialFile();
+            return false;
+        }
+
+        ExoHeader hashHeader;
+        if (!hashHeader.deserializeFromBuffer(buffer.data())) {
+            errorMsg = "Failed to deserialize hash header";
+            deletePartialFile();
+            return false;
+        }
+
+        if (!hashHeader.isValid() || hashHeader.getPacketType() != PacketType::HASH) {
+            errorMsg = "Invalid hash header received";
+            deletePartialFile();
+            return false;
+        }
+
+        const auto senderHash = hashHeader.getSha256Bytes();
+        const bool match = HashUtils::compareHashes(
+            reinterpret_cast<const unsigned char*>(senderHash.data()),
+            reinterpret_cast<const unsigned char*>(m_sha256Hash)
+        );
+
+        const PacketType responseType = match ? PacketType::HASH_OK : PacketType::HASH_BAD;
+        std::string responseError;
+        (void)sendResponse(stream, responseType, responseError);
+
+        if (!match) {
+            errorMsg = "SHA-256 mismatch: transfer corrupted or tampered";
+            deletePartialFile();
+            return false;
+        }
+    }
+
     return true;
 }
 
-bool FileReceiver::receiveOfferHeader(SOCKET socket, ExoHeader& header,
+bool FileReceiver::receiveOfferHeader(TransportStream& stream, ExoHeader& header,
                                        std::string& errorMsg)
 {
     // Receive header
     std::vector<uint8_t> buffer(HEADER_SIZE);
-    if (!recvExact(socket, buffer.data(), HEADER_SIZE, errorMsg)) {
+    if (!stream.recvExact(buffer.data(), HEADER_SIZE, errorMsg)) {
         errorMsg = "Failed to receive offer header: " + errorMsg;
         return false;
     }
@@ -579,8 +737,8 @@ bool FileReceiver::receiveOfferHeader(SOCKET socket, ExoHeader& header,
     return true;
 }
 
-bool FileReceiver::sendResponse(SOCKET socket, PacketType responseType,
-                                 std::string& errorMsg)
+bool FileReceiver::sendResponse(TransportStream& stream, PacketType responseType,
+                                  std::string& errorMsg)
 {
     // Create response header
     ExoHeader response(responseType, 0, "");
@@ -593,7 +751,7 @@ bool FileReceiver::sendResponse(SOCKET socket, PacketType responseType,
     }
 
     // Send response
-    if (!sendExact(socket, buffer.data(), HEADER_SIZE, errorMsg)) {
+    if (!stream.sendExact(buffer.data(), HEADER_SIZE, errorMsg)) {
         errorMsg = "Failed to send response header: " + errorMsg;
         return false;
     }
@@ -601,9 +759,9 @@ bool FileReceiver::sendResponse(SOCKET socket, PacketType responseType,
     return true;
 }
 
-bool FileReceiver::receiveFileData(SOCKET socket, const ExoHeader& header,
-                                     std::string& errorMsg,
-                                     ProgressCallback progress)
+bool FileReceiver::receiveFileData(TransportStream& stream, const ExoHeader& header,
+                                      std::string& errorMsg,
+                                      ProgressCallback progress)
 {
     // Generate unique filename
     m_outputPath = generateUniqueFilename(m_downloadDir, m_fileName);
@@ -615,6 +773,10 @@ bool FileReceiver::receiveFileData(SOCKET socket, const ExoHeader& header,
         return false;
     }
     m_fileCreated = true;
+
+    // Increase file stream buffering for large sequential writes
+    std::vector<char> outIoBuffer(1024 * 1024);
+    (void)m_outputFile.rdbuf()->pubsetbuf(outIoBuffer.data(), static_cast<std::streamsize>(outIoBuffer.size()));
 
     // Reset hash
     if (!m_incrementalHash.reset()) {
@@ -636,7 +798,7 @@ bool FileReceiver::receiveFileData(SOCKET socket, const ExoHeader& header,
         }
 
         // Receive chunk
-        if (!recvExact(socket, buffer.data(), toRead, errorMsg)) {
+        if (!stream.recvExact(buffer.data(), toRead, errorMsg)) {
             errorMsg = "Failed to receive file data: " + errorMsg;
             deletePartialFile();
             return false;

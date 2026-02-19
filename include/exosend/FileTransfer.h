@@ -21,6 +21,7 @@ namespace ExoSend {
 
 // Forward declaration for TLS support
 class TlsSocket;
+class TransportStream;
 
 /**
  * @brief Progress callback function type
@@ -68,7 +69,7 @@ public:
      *
      * Does not open the file yet. Call sendFile() to initiate transfer.
      */
-    explicit FileSender(const std::string& filePath);
+    explicit FileSender(const std::string& filePath, const std::string& senderUuid = {});
 
     /**
      * @brief Destructor
@@ -98,6 +99,17 @@ public:
      * 5. Computes SHA-256 hash during transfer
      */
     bool sendFile(SOCKET socket,
+                  std::string& errorMsg,
+                  ProgressCallback progress = nullptr);
+
+    /**
+     * @brief Send the file over a connected transport (plain TCP or TLS)
+     * @param stream Connected transport stream
+     * @param errorMsg Output error message if transfer fails
+     * @param progress Optional progress callback (can be nullptr)
+     * @return true if transfer successful, false otherwise
+     */
+    bool sendFile(TransportStream& stream,
                   std::string& errorMsg,
                   ProgressCallback progress = nullptr);
 
@@ -155,7 +167,7 @@ private:
      * @param errorMsg Output error message
      * @return true if successful
      */
-    bool sendOfferHeader(SOCKET socket, std::string& errorMsg);
+    bool sendOfferHeader(TransportStream& stream, std::string& errorMsg);
 
     /**
      * @brief Wait for response header from receiver
@@ -164,7 +176,7 @@ private:
      * @param errorMsg Output error message
      * @return true if successful
      */
-    bool waitForResponse(SOCKET socket, PacketType& response, std::string& errorMsg);
+    bool waitForResponse(TransportStream& stream, PacketType& response, std::string& errorMsg);
 
     /**
      * @brief Stream file data over socket
@@ -173,7 +185,7 @@ private:
      * @param progress Optional progress callback
      * @return true if successful
      */
-    bool sendFileData(SOCKET socket, std::string& errorMsg,
+    bool sendFileData(TransportStream& stream, std::string& errorMsg,
                       ProgressCallback progress);
 
     /**
@@ -187,6 +199,7 @@ private:
     // Member variables
     std::string m_filePath;              ///< Full path to source file
     std::string m_fileName;              ///< Just the filename
+    std::string m_senderUuid;            ///< Sender device UUID (v0.2.0+)
     uint64_t m_fileSize;                 ///< File size in bytes
     unsigned char m_sha256Hash[HASH_SIZE];  ///< Computed SHA-256 hash
     std::string m_sha256HashString;      ///< Hash as hex string
@@ -265,6 +278,14 @@ public:
                      ProgressCallback progress = nullptr);
 
     /**
+     * @brief Receive file from a connected transport (plain TCP or TLS)
+     */
+    bool receiveFile(TransportStream& stream,
+                     std::string& errorMsg,
+                     std::function<bool(const ExoHeader&)> acceptCallback,
+                     ProgressCallback progress = nullptr);
+
+    /**
      * @brief Receive file from a connected TCP socket (with pre-received header)
      * @param socket Connected TCP socket
      * @param preReceivedHeader Already-received OFFER header from peer
@@ -278,6 +299,15 @@ public:
      * directly to the accept/reject decision and file data reception.
      */
     bool receiveFile(SOCKET socket,
+                     const ExoHeader& preReceivedHeader,
+                     std::string& errorMsg,
+                     std::function<bool(const ExoHeader&)> acceptCallback,
+                     ProgressCallback progress = nullptr);
+
+    /**
+     * @brief Receive file from a connected transport (plain TCP or TLS), with pre-received header
+     */
+    bool receiveFile(TransportStream& stream,
                      const ExoHeader& preReceivedHeader,
                      std::string& errorMsg,
                      std::function<bool(const ExoHeader&)> acceptCallback,
@@ -343,7 +373,7 @@ private:
      * @param errorMsg Output error message
      * @return true if successful
      */
-    bool receiveOfferHeader(SOCKET socket, ExoHeader& header, std::string& errorMsg);
+    bool receiveOfferHeader(TransportStream& stream, ExoHeader& header, std::string& errorMsg);
 
     /**
      * @brief Send response header to sender
@@ -352,7 +382,7 @@ private:
      * @param errorMsg Output error message
      * @return true if successful
      */
-    bool sendResponse(SOCKET socket, PacketType responseType, std::string& errorMsg);
+    bool sendResponse(TransportStream& stream, PacketType responseType, std::string& errorMsg);
 
     /**
      * @brief Receive file data from socket and write to disk
@@ -362,7 +392,7 @@ private:
      * @param progress Optional progress callback
      * @return true if successful
      */
-    bool receiveFileData(SOCKET socket, const ExoHeader& header,
+    bool receiveFileData(TransportStream& stream, const ExoHeader& header,
                          std::string& errorMsg, ProgressCallback progress);
 
     /**

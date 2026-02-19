@@ -152,7 +152,7 @@ constexpr uint32_t GC_INTERVAL_MS = 5000;
  * This size provides a good balance between throughput and memory usage.
  * Larger buffers may improve performance but use more RAM.
  */
-constexpr size_t BUFFER_SIZE = 65536;  // 64 KB
+constexpr size_t BUFFER_SIZE = 262144;  // 256 KB
 
 /**
  * @brief Binary protocol header size
@@ -186,6 +186,14 @@ constexpr size_t MAX_DISPLAY_NAME = 64;
  * This accommodates standard UUID formats and provides a safety margin.
  */
 constexpr size_t MAX_UUID_LENGTH = 64;
+
+/**
+ * @brief Default maximum allowed incoming offer size (bytes)
+ *
+ * This is a safety and DoS mitigation guardrail. Users may override this
+ * limit in settings.
+ */
+constexpr uint64_t DEFAULT_MAX_INCOMING_SIZE_BYTES = 10ULL * 1024ULL * 1024ULL * 1024ULL;  // 10 GB
 
 /** @} */ // end of BufferSizes
 

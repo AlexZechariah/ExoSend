@@ -8,6 +8,7 @@
 
 #include "exosend/DiscoveryService.h"
 #include "exosend/config.h"
+#include "exosend/FingerprintUtils.h"
 #include "exosend/PeerInfo.h"
 #include "exosend/ThreadSafeLog.h"
 #include "exosend/UuidGenerator.h"
@@ -209,6 +210,32 @@ void DiscoveryService::setTcpPort(uint16_t port) {
     m_tcpPort = port;
 }
 
+void DiscoveryService::setDeviceUuid(const std::string& uuid) {
+    if (m_running.load()) {
+        return;
+    }
+
+    if (uuid.empty() || uuid.size() > MAX_UUID_LENGTH) {
+        return;
+    }
+
+    m_uuid = uuid;
+}
+
+void DiscoveryService::setCertificateFingerprintSha256Hex(const std::string& fingerprintSha256Hex) {
+    if (m_running.load()) {
+        return;
+    }
+
+    const std::string normalized = FingerprintUtils::normalizeSha256Hex(fingerprintSha256Hex);
+    if (normalized.empty()) {
+        m_certFingerprintSha256Hex.clear();
+        return;
+    }
+
+    m_certFingerprintSha256Hex = normalized;
+}
+
 //=============================================================================
 // Private Thread Functions
 //=============================================================================
@@ -339,6 +366,9 @@ std::string DiscoveryService::generateBeaconJson() const {
     beacon["display_name"] = m_displayName;
     beacon["os_platform"] = OS_PLATFORM;
     beacon["tcp_port"] = m_tcpPort;
+    if (!m_certFingerprintSha256Hex.empty()) {
+        beacon["cert_fingerprint_sha256"] = m_certFingerprintSha256Hex;
+    }
 
     return beacon.dump();
 }
@@ -593,6 +623,10 @@ void DiscoveryService::parseBeacon(const std::string& jsonStr, const std::string
 
     std::string displayName = beacon["display_name"];
     uint16_t tcpPort = beacon["tcp_port"];
+    std::string fingerprint;
+    if (beacon.contains("cert_fingerprint_sha256") && beacon["cert_fingerprint_sha256"].is_string()) {
+        fingerprint = FingerprintUtils::normalizeSha256Hex(beacon["cert_fingerprint_sha256"].get<std::string>());
+    }
 
     // Sanitize display name length
     if (displayName.length() > MAX_DISPLAY_NAME) {
@@ -606,9 +640,15 @@ void DiscoveryService::parseBeacon(const std::string& jsonStr, const std::string
     if (it != m_peers.end()) {
         // Update existing peer
         it->second.lastSeen = std::chrono::steady_clock::now();
+        it->second.displayName = displayName;
+        it->second.ipAddress = senderIp;
+        it->second.tcpPort = tcpPort;
+        if (!fingerprint.empty()) {
+            it->second.certFingerprintSha256Hex = fingerprint;
+        }
     } else {
         // Add new peer
-        PeerInfo peer(uuid, displayName, senderIp, tcpPort);
+        PeerInfo peer(uuid, displayName, senderIp, tcpPort, fingerprint);
         m_peers[uuid] = peer;
     }
 }

@@ -24,6 +24,7 @@
 IncomingTransferDialog::IncomingTransferDialog(const QString& peerName,
                                                const QString& peerIp,
                                                const QString& peerUuid,
+                                               quint16 peerPort,
                                                const QString& filename,
                                                qint64 fileSize,
                                                const QString& defaultPath,
@@ -32,6 +33,7 @@ IncomingTransferDialog::IncomingTransferDialog(const QString& peerName,
     , m_peerName(peerName)
     , m_peerIp(peerIp)
     , m_peerUuid(peerUuid)
+    , m_peerPort(peerPort)
     , m_filename(filename)
     , m_fileSize(fileSize)
     , m_accepted(false)
@@ -143,15 +145,20 @@ void IncomingTransferDialog::setupUi()
     // Info label with peer name and muted IP address
     m_infoLabel = new QLabel();
     QString sizeStr = formatFileSize(m_fileSize);
-    // "Asus (192.168.83.1:9999)" with gray IP color
-    QString messageHtml = QString("<b>%1</b> <span style='color:#808080;'>(%2:%3)</span> wants to send you a file:<br><br>"
-                            "File: <b>%4</b><br>"
-                            "Size: %5")
-                        .arg(m_peerName)
-                        .arg(m_peerIp)
-                        .arg(9999)  // TODO: Use actual port from peer info
-                        .arg(m_filename)
-                        .arg(sizeStr);
+
+    // "Asus (192.168.83.1:9999)" with gray IP color (port omitted if unknown)
+    QString peerAddress = m_peerIp;
+    if (m_peerPort != 0) {
+        peerAddress += ":" + QString::number(m_peerPort);
+    }
+
+    QString messageHtml = QString("<b>%1</b> <span style='color:#808080;'>(%2)</span> wants to send you a file:<br><br>"
+                                  "File: <b>%3</b><br>"
+                                  "Size: %4")
+                              .arg(m_peerName)
+                              .arg(peerAddress)
+                              .arg(m_filename)
+                              .arg(sizeStr);
     m_infoLabel->setText(messageHtml);
     m_infoLabel->setTextFormat(Qt::RichText);
     m_infoLabel->setWordWrap(true);
@@ -195,8 +202,8 @@ void IncomingTransferDialog::setupUi()
     m_warningLabel = new QLabel();
     m_warningLabel->setWordWrap(true);
     m_warningLabel->setStyleSheet("color: orange; padding: 5px; background-color: #FFF3CD; border-radius: 3px;");
-    m_warningLabel->setText("⚠ Warning: Only accept files from trusted sources. "
-                          "Ensure you recognize the sender before accepting.");
+    m_warningLabel->setText("Warning: Only accept files from trusted sources. "
+                            "Ensure you recognize the sender before accepting.");
     mainLayout->addWidget(m_warningLabel);
 
     // Error label

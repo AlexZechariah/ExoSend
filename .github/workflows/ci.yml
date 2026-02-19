@@ -222,26 +222,68 @@ jobs:
         ctest -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
 
     # =========================================================================
-    # Run Integration Tests
+    # Validate runtime deployment completeness
     # =========================================================================
-    - name: Run Discovery Test
-      working-directory: build/release/bin/${{ env.BUILD_CONFIGURATION }}
+    - name: Validate runtime files
       run: |
-        Start-Process discovery_test.exe -NoNewWindow -PassThru | Out-Null
-        Start-Sleep -Seconds 5
-        Get-Process discovery_test -ErrorAction SilentlyContinue | Stop-Process
+        $ErrorActionPreference = 'Stop'
+
+        $buildDir = "build/release/bin/${{ env.BUILD_CONFIGURATION }}"
+        $required = @(
+          (Join-Path $buildDir "ExoSend.exe"),
+          (Join-Path $buildDir "ExoSendFirewallHelper.exe"),
+          (Join-Path $buildDir "Qt6Core.dll"),
+          (Join-Path $buildDir "Qt6Gui.dll"),
+          (Join-Path $buildDir "Qt6Widgets.dll"),
+          (Join-Path $buildDir "libcrypto-3-x64.dll"),
+          (Join-Path $buildDir "libssl-3-x64.dll"),
+          (Join-Path $buildDir "platforms\\qwindows.dll"),
+          (Join-Path $buildDir "styles\\qmodernwindowsstyle.dll")
+        )
+
+        $missing = $required | Where-Object { -not (Test-Path $_) }
+        if ($missing.Count -gt 0) {
+          $missing | ForEach-Object { Write-Host "Missing required runtime file: $_" }
+          throw "Deployment completeness check failed."
+        }
+
+    # =========================================================================
+    # Package Release ZIP (CI artifact)
+    # =========================================================================
+    - name: Package ExoSend.zip
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $buildDir = "build/release/bin/${{ env.BUILD_CONFIGURATION }}"
+        $distDir = "dist"
+        $stageDir = Join-Path $distDir "ExoSend"
+        $zipPath = Join-Path $distDir "ExoSend.zip"
+
+        Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+        Copy-Item (Join-Path $buildDir "ExoSend.exe") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "ExoSendFirewallHelper.exe") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "*.dll") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "platforms") $stageDir -Recurse -Force
+        Copy-Item (Join-Path $buildDir "styles") $stageDir -Recurse -Force
+
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath -Force
+
+        if (-not (Test-Path $zipPath)) {
+          throw "ZIP not created at '$zipPath'."
+        }
+        Write-Host "Created: $zipPath"
 
     # =========================================================================
     # Upload Build Artifacts
     # =========================================================================
-    - name: Upload Executables
+    - name: Upload ExoSend.zip
       uses: actions/upload-artifact@v4
       with:
-        name: ExoSend
-        path: |
-          build/release/bin/${{ env.BUILD_CONFIGURATION }}/ExoSend.exe
-          build/release/bin/${{ env.BUILD_CONFIGURATION }}/*.dll
-          build/release/bin/${{ env.BUILD_CONFIGURATION }}/platforms/
+        name: ExoSend.zip
+        path: dist/ExoSend.zip
         retention-days: 30
 
     # =========================================================================
@@ -258,7 +300,7 @@ jobs:
         Write-Host "Compiler: MSVC"
         Write-Host ""
         Write-Host "Artifacts:"
-        Write-Host "  - ExoSend executable"
+        Write-Host "  - ExoSend.zip"
         Write-Host "============================================================"
 
     # =========================================================================

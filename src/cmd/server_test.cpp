@@ -14,6 +14,7 @@
 #include "exosend/DiscoveryService.h"
 #include "exosend/TransferServer.h"
 #include "exosend/TransferQueueManager.h"
+#include "exosend/CertificateManager.h"
 #include "exosend/config.h"
 #include <iostream>
 #include <string>
@@ -140,6 +141,14 @@ int main(int argc, char* argv[]) {
 
     std::cout << "[INFO] Starting Discovery Service...\n";
 
+    {
+        std::string certErr;
+        if (!CertificateManager::ensureCertificateExists(certErr)) {
+            std::cerr << "[ERROR] Failed to ensure TLS certificate exists: " << certErr << "\n";
+            return 1;
+        }
+    }
+
     DiscoveryService discovery;
     g_discovery = &discovery;
 
@@ -176,10 +185,14 @@ int main(int argc, char* argv[]) {
     // Set incoming connection callback with user prompt
     server.setIncomingConnectionCallback([](const std::string& clientIp,
                                               const ExoHeader& header,
-                                              const std::string& pendingSessionId) -> bool {
+                                              const std::string& pendingSessionId,
+                                              const std::string& peerFingerprintSha256Hex) -> bool {
         std::cout << "[INCOMING] Connection from " << clientIp << "\n";
         std::cout << "[INCOMING] File: " << header.getFilename()
                   << " (" << formatFileSize(header.fileSize) << ")\n";
+        if (!peerFingerprintSha256Hex.empty()) {
+            std::cout << "[INCOMING] Peer fingerprint (SHA-256): " << peerFingerprintSha256Hex << "\n";
+        }
 
         // Prompt user for acceptance
         std::cout << "\nAccept this transfer? (y/n): ";

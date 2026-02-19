@@ -5,6 +5,8 @@
 
 #include "exosend/TransferServer.h"
 #include "exosend/FileTransfer.h"
+#include "exosend/TlsSocket.h"
+#include "exosend/TransportStream.h"
 #include "exosend/UuidGenerator.h"
 #include "exosend/Debug.h"
 #include "exosend/ThreadSafeLog.h"
@@ -27,6 +29,12 @@ namespace ExoSend {
 namespace {
     // Thread-safe logging macro - uses ThreadSafeLog for all crash logging
     #define LogTransferCrash(msg) ExoSend::ThreadSafeLog::log(msg)
+
+    void tuneSocketBuffers(SOCKET socket) {
+        const int buf = 4 * 1024 * 1024;
+        (void)setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+        (void)setsockopt(socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+    }
 } // anonymous namespace
 
 //=============================================================================
@@ -40,6 +48,7 @@ namespace {
 TransferServer::TransferServer(uint16_t port)
     : m_port(port)
     , m_downloadDir(".")  // Default to current directory
+    , m_maxIncomingSizeBytes(DEFAULT_MAX_INCOMING_SIZE_BYTES)
     , m_listenSocket(INVALID_SOCKET)
     , m_socketInitialized(false)
     , m_activeSessionCount(0)
@@ -228,18 +237,12 @@ void TransferServer::listenerThreadFunc() {
             continue;
         }
 
+        tuneSocketBuffers(clientSocket);
+
         // Extract client IP address
         char ipStr[INET_ADDRSTRLEN];
         inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, sizeof(ipStr));
         std::string clientIp(ipStr);
-
-        // Check session limit
-        if (m_activeSessionCount.load() >= MAX_CONCURRENT_TRANSFERS) {
-            // Send BUSY response
-            sendBusyResponse(clientSocket);
-            closesocket(clientSocket);
-            continue;
-        }
 
         // Handle the client in a dedicated thread so the listener is never blocked.
         // Note: Previously handleClient() was called directly on the listener thread,
@@ -316,30 +319,67 @@ void TransferServer::cleanupThreadFunc() {
 //=============================================================================
 
 void TransferServer::handleClient(SOCKET clientSocket, const std::string& clientIp) {
-    // Step 1: Receive and parse ExoHeader
-    std::vector<uint8_t> headerBuffer(HEADER_SIZE);
-    int bytesReceived = recv(clientSocket, reinterpret_cast<char*>(headerBuffer.data()),
-                              HEADER_SIZE, 0);
-
-    if (bytesReceived != HEADER_SIZE) {
+    // Step 0: Enforce TLS for v0.2.0+ transfers
+    std::string tlsError;
+    TlsSocket tls(clientSocket, TlsRole::SERVER);
+    if (!tls.handshake(tlsError)) {
         closesocket(clientSocket);
         return;
     }
 
-    // Deserialize header from network byte order
+    TlsTransportStream stream(tls);
+
+    std::string fpError;
+    const std::string peerFingerprint = tls.getPeerFingerprint(fpError);
+
+    // Step 1: Receive and parse ExoHeader over TLS
+    std::vector<uint8_t> headerBuffer(HEADER_SIZE);
+    std::string headerError;
+    if (!stream.recvExact(headerBuffer.data(), HEADER_SIZE, headerError)) {
+        stream.shutdown();
+        closesocket(clientSocket);
+        return;
+    }
+
     ExoHeader offerHeader;
-    std::memcpy(&offerHeader, headerBuffer.data(), sizeof(ExoHeader));
-    offerHeader.magic = ntohl(offerHeader.magic);
-    offerHeader.fileSize = ntohll(offerHeader.fileSize);
-    offerHeader.filenameLength = ntohs(offerHeader.filenameLength);
+    if (!offerHeader.deserializeFromBuffer(headerBuffer.data())) {
+        stream.shutdown();
+        closesocket(clientSocket);
+        return;
+    }
 
     // Validate header
     if (!offerHeader.isValid() || offerHeader.getPacketType() != PacketType::OFFER) {
+        stream.shutdown();
+        closesocket(clientSocket);
+        return;
+    }
+
+    // Reject oversized offers early (DoS mitigation)
+    if (m_maxIncomingSizeBytes > 0 && offerHeader.fileSize > m_maxIncomingSizeBytes) {
+        uint8_t rejectBuffer[HEADER_SIZE];
+        ExoHeader rejectHeader(PacketType::REJECT, 0, "");
+        (void)rejectHeader.serializeToBuffer(rejectBuffer);
+        std::string rejectError;
+        (void)stream.sendExact(rejectBuffer, HEADER_SIZE, rejectError);
+        stream.shutdown();
         closesocket(clientSocket);
         return;
     }
 
     std::string filename = offerHeader.getFilename();
+
+    // Enforce session limit after TLS handshake and offer receive.
+    if (m_activeSessionCount.load() >= MAX_CONCURRENT_TRANSFERS) {
+        uint8_t busyBuffer[HEADER_SIZE];
+        ExoHeader busyHeader(PacketType::BUSY, 0, "");
+        (void)busyHeader.serializeToBuffer(busyBuffer);
+        std::string busyError;
+        (void)stream.sendExact(busyBuffer, HEADER_SIZE, busyError);
+        stream.shutdown();
+        closesocket(clientSocket);
+        return;
+    }
 
     // Step 2: Create pending session ID for tracking
     std::string tempSessionId = "pending_" + UuidGenerator::generate();
@@ -356,7 +396,7 @@ void TransferServer::handleClient(SOCKET clientSocket, const std::string& client
     // Step 4: Call callback with tempSessionId - this will show dialog and WAIT for result
     bool accepted = false;
     if (m_incomingConnectionCallback) {
-        accepted = m_incomingConnectionCallback(clientIp, offerHeader, tempSessionId);
+        accepted = m_incomingConnectionCallback(clientIp, offerHeader, tempSessionId, peerFingerprint);
     }
 
     // Step 5: Clean up pending connection
@@ -371,7 +411,9 @@ void TransferServer::handleClient(SOCKET clientSocket, const std::string& client
         uint8_t rejectBuffer[HEADER_SIZE];
         ExoHeader rejectHeader(PacketType::REJECT, 0, "");
         rejectHeader.serializeToBuffer(rejectBuffer);
-        send(clientSocket, reinterpret_cast<const char*>(rejectBuffer), HEADER_SIZE, 0);
+        std::string rejectError;
+        (void)stream.sendExact(rejectBuffer, HEADER_SIZE, rejectError);
+        stream.shutdown();
         closesocket(clientSocket);
         return;
     }
@@ -380,7 +422,8 @@ void TransferServer::handleClient(SOCKET clientSocket, const std::string& client
     uint8_t acceptBuffer[HEADER_SIZE];
     ExoHeader acceptHeader(PacketType::ACCEPT, 0, "");
     acceptHeader.serializeToBuffer(acceptBuffer);
-    send(clientSocket, reinterpret_cast<const char*>(acceptBuffer), HEADER_SIZE, 0);
+    std::string acceptError;
+    (void)stream.sendExact(acceptBuffer, HEADER_SIZE, acceptError);
 
     // Step 8: Create session and store in m_sessions map
     // Note: Store session in map instead of local variable to prevent
@@ -442,7 +485,7 @@ void TransferServer::handleClient(SOCKET clientSocket, const std::string& client
     bool success = false;
 
     try {
-        success = sessionPtr->runIncomingTransfer(clientSocket, offerHeader, errorMsg);
+        success = sessionPtr->runIncomingTransfer(stream, offerHeader, errorMsg);
     } catch (const std::exception& e) {
         errorMsg = std::string("Exception during transfer: ") + e.what();
         success = false;
@@ -453,6 +496,9 @@ void TransferServer::handleClient(SOCKET clientSocket, const std::string& client
         success = false;
         LogTransferCrash("=== handleClient: UNKNOWN EXCEPTION in runIncomingTransfer ===");
     }
+
+    // Gracefully shutdown TLS after transfer completes.
+    stream.shutdown();
 
     // Trace: Log after runIncomingTransfer
     LogTransferCrash("=== handleClient: runIncomingTransfer returned ===");
@@ -532,7 +578,8 @@ void TransferServer::sendBusyResponse(SOCKET socket) {
     busyHeader.serializeToBuffer(buffer);
 
     // Send response
-    send(socket, reinterpret_cast<const char*>(buffer), HEADER_SIZE, 0);
+    std::string errorMsg;
+    (void)sendExact(socket, buffer, HEADER_SIZE, errorMsg);
 }
 
 //=============================================================================

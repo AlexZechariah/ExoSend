@@ -139,6 +139,72 @@ target_include_directories(fault_injection_test
 gtest_discover_tests(fault_injection_test)
 
 # ============================================================================
+# Test Executable: trust_store_test
+# Tests pairing and pinning trust store persistence
+# ============================================================================
+add_executable(trust_store_test
+    trust_store_test.cpp
+)
+
+target_link_libraries(trust_store_test
+    PRIVATE
+    exosend-core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+target_include_directories(trust_store_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+gtest_discover_tests(trust_store_test)
+
+# ============================================================================
+# Test Executable: fingerprint_utils_test
+# Tests fingerprint normalization/formatting for pairing and pinning
+# ============================================================================
+add_executable(fingerprint_utils_test
+    fingerprint_utils_test.cpp
+)
+
+target_link_libraries(fingerprint_utils_test
+    PRIVATE
+    exosend-core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+target_include_directories(fingerprint_utils_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+gtest_discover_tests(fingerprint_utils_test)
+
+# ============================================================================
+# Test Executable: queue_manager_test
+# Tests TransferQueueManager concurrency accounting
+# ============================================================================
+add_executable(queue_manager_test
+    queue_manager_test.cpp
+)
+
+target_link_libraries(queue_manager_test
+    PRIVATE
+    exosend-core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+target_include_directories(queue_manager_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+gtest_discover_tests(queue_manager_test)
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 message(STATUS "")
@@ -150,6 +216,7 @@ message(STATUS "  hash_test            - SHA-256 hashing tests")
 message(STATUS "  json_test            - Discovery beacon JSON tests")
 message(STATUS "  integration_test     - Multi-NIC, GC, file transfer tests")
 message(STATUS "  fault_injection_test - Error handling and fault injection")
+message(STATUS "  fingerprint_utils_test - Fingerprint normalization tests")
 message(STATUS "  benchmark_tool       - Performance benchmarking tool")
 message(STATUS "==================================================")
 message(STATUS "")

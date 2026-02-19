@@ -20,7 +20,9 @@
 #include <QMap>
 #include <fstream>
 #include <unordered_set>
+#include <cstdint>
 #include <nlohmann/json.hpp>
+#include "exosend/TrustStore.h"
 
 using json = nlohmann::json;
 
@@ -119,6 +121,28 @@ public:
      * @return Map of peer UUID -> auto-accept enabled
      */
     QMap<QString, bool> getAllAutoAcceptPreferences() const;
+
+    /**
+     * @brief Get the maximum allowed incoming offer size (bytes)
+     */
+    uint64_t getMaxIncomingSizeBytes() const;
+
+    /**
+     * @brief Set the maximum allowed incoming offer size (bytes)
+     *
+     * Emits settingsChanged() if value actually changes and auto-saves.
+     */
+    void setMaxIncomingSizeBytes(uint64_t bytes);
+
+    /**
+     * @brief Trust store accessors (pairing + pinning)
+     */
+    bool isPeerPinned(const QString& peerUuid) const;
+    QString getPinnedFingerprint(const QString& peerUuid) const;
+    void pinPeerFingerprint(const QString& peerUuid,
+                            const QString& fingerprintSha256Hex,
+                            const QString& displayName);
+    void updatePeerSeen(const QString& peerUuid, const QString& displayName);
 
     // ========================================================================
     // Settings Mutators
@@ -259,6 +283,8 @@ private:
     bool m_showCloseWarning;     ///< Whether to show close-to-tray warning
     int m_peerTimeout;           ///< Peer timeout in seconds (default 3, range 1-10)
     QMap<QString, bool> m_autoAcceptPeers;  ///< Auto-accept preferences by peer UUID
+    ExoSend::TrustStore m_trustStore;  ///< Pairing and pinning trust store
+    uint64_t m_maxIncomingSizeBytes;   ///< Maximum allowed incoming offer size (bytes)
     bool m_settingsLoaded;       ///< True if loadSettings() was called
 };
 

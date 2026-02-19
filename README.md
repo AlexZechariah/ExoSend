@@ -14,8 +14,10 @@ ExoSend enables seamless peer-to-peer file transfers over local WiFi networks wi
 - [Features](#features)
 - [Quick Start](#quick-start)
 - [Usage](#usage)
+- [Pairing and Trust](#pairing-and-trust)
 - [Firewall Configuration](#firewall-configuration)
 - [Troubleshooting](#troubleshooting)
+- [Certificate Management](#certificate-management)
 - [License](#license)
 
 ---
@@ -38,7 +40,7 @@ ExoSend enables seamless peer-to-peer file transfers over local WiFi networks wi
 
 ### Installation
 
-1. Download the latest release from [Releases](https://github.com/yourusername/ExoSend/releases)
+1. Download the latest release from [Releases](https://github.com/AlexZechariah/ExoSend/releases)
 2. Extract the ZIP file
 3. Run `ExoSend.exe`
 
@@ -61,20 +63,29 @@ ExoSend enables seamless peer-to-peer file transfers over local WiFi networks wi
 - System tray minimize
 - Settings persistence
 
+## Pairing and Trust
+
+ExoSend uses a TOFU (trust on first use) model with TLS certificate fingerprint pinning:
+
+- The first time you send to or receive from a peer, ExoSend prompts you to pair by pinning the peer certificate fingerprint (SHA-256).
+- If a pinned peer's fingerprint changes later, ExoSend blocks the transfer and offers a re-pair option.
+
+Pairing and settings are stored per-machine in the user profile (typically under `%LOCALAPPDATA%`), and are not transferred when you copy the app folder to another PC or VM.
+
 ### Firewall Configuration
 
 ExoSend requires Windows Firewall rules for:
 - **UDP port 8888** - Peer discovery beacons
 - **TCP port 9999** - File transfer connections
 
-The application will prompt to configure these rules automatically on first run.
+The application checks these rules on startup and can configure them automatically (requires Administrator approval via UAC). Ensure `ExoSendFirewallHelper.exe` is present next to `ExoSend.exe`.
 
 ### Manual Firewall Setup
 
 If automatic setup fails, open Windows Firewall with Advanced Security:
-1. Inbound Rules → New Rule
-2. Port → UDP → 8888 → Allow → Name: "ExoSend Discovery"
-3. Port → TCP → 9999 → Allow → Name: "ExoSend Transfer"
+1. Inbound Rules -> New Rule
+2. Port -> UDP -> 8888 -> Allow -> Name: "ExoSend Discovery"
+3. Port -> TCP -> 9999 -> Allow -> Name: "ExoSend Transfer"
 
 ---
 
@@ -112,8 +123,8 @@ ExoSend uses TLS 1.2+ encryption with self-signed certificates automatically gen
 Certificates are stored in: `%APPDATA%\ExoSend\certs\`
 
 **Security Notes:**
-- Self-signed certificates provide encryption but NOT authentication
-- For production use, consider implementing certificate authority (CA) support
+- Self-signed certificates provide encryption; ExoSend authenticates peers by pairing and pinning certificate fingerprints (TOFU).
+- For production use, consider certificate authority (CA) support and stronger device identity management.
 
 ---
 

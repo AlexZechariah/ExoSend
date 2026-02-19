@@ -7,7 +7,9 @@
  */
 
 #include "exosend/QtUi/SettingsManager.h"
+#include "exosend/FingerprintUtils.h"
 #include "exosend/UuidGenerator.h"
+#include "exosend/config.h"
 #include <QStandardPaths>
 #include <QDir>
 #include <QFile>
@@ -29,6 +31,8 @@ SettingsManager::SettingsManager(QObject* parent)
     , m_windowGeometry()
     , m_showCloseWarning(true)
     , m_peerTimeout(10)  // Default 10 seconds (matches DiscoveryService PEER_TIMEOUT_MS)
+    , m_trustStore()
+    , m_maxIncomingSizeBytes(ExoSend::DEFAULT_MAX_INCOMING_SIZE_BYTES)
     , m_settingsLoaded(false)
 {
     // Set initial defaults (will be overridden by loadSettings())
@@ -75,6 +79,11 @@ bool SettingsManager::getShowCloseWarning() const
 int SettingsManager::getPeerTimeout() const
 {
     return m_peerTimeout;
+}
+
+uint64_t SettingsManager::getMaxIncomingSizeBytes() const
+{
+    return m_maxIncomingSizeBytes;
 }
 
 // ========================================================================
@@ -129,6 +138,56 @@ void SettingsManager::setPeerTimeout(int seconds)
         emit settingsChanged();
         saveSettings();
     }
+}
+
+void SettingsManager::setMaxIncomingSizeBytes(uint64_t bytes)
+{
+    if (bytes == 0) {
+        bytes = ExoSend::DEFAULT_MAX_INCOMING_SIZE_BYTES;
+    }
+
+    if (m_maxIncomingSizeBytes != bytes) {
+        m_maxIncomingSizeBytes = bytes;
+        emit settingsChanged();
+        saveSettings();
+    }
+}
+
+bool SettingsManager::isPeerPinned(const QString& peerUuid) const
+{
+    return m_trustStore.hasPeer(peerUuid.toStdString());
+}
+
+QString SettingsManager::getPinnedFingerprint(const QString& peerUuid) const
+{
+    const auto* rec = m_trustStore.getPeer(peerUuid.toStdString());
+    if (!rec) {
+        return {};
+    }
+    return QString::fromStdString(rec->pinnedFingerprintSha256Hex);
+}
+
+void SettingsManager::pinPeerFingerprint(const QString& peerUuid,
+                                         const QString& fingerprintSha256Hex,
+                                         const QString& displayName)
+{
+    const std::string fp = ExoSend::FingerprintUtils::normalizeSha256Hex(fingerprintSha256Hex.toStdString());
+    if (fp.empty() || !ExoSend::TrustStore::isValidFingerprintSha256Hex(fp)) {
+        return;
+    }
+
+    const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs).toStdString();
+    m_trustStore.pinPeer(peerUuid.toStdString(), fp, displayName.toStdString(), now);
+    emit settingsChanged();
+    saveSettings();
+}
+
+void SettingsManager::updatePeerSeen(const QString& peerUuid, const QString& displayName)
+{
+    const std::string now = QDateTime::currentDateTimeUtc().toString(Qt::ISODateWithMs).toStdString();
+    m_trustStore.updateSeen(peerUuid.toStdString(), displayName.toStdString(), now);
+    emit settingsChanged();
+    saveSettings();
 }
 
 bool SettingsManager::getAutoAcceptForPeer(const QString& peerUuid) const
@@ -238,6 +297,21 @@ bool SettingsManager::loadSettings()
             }
         }
 
+        // Load trust store (pairing + pinning)
+        if (j.contains("trust_store")) {
+            m_trustStore = ExoSend::TrustStore::fromJson(j["trust_store"]);
+        }
+
+        // Load max incoming size
+        if (j.contains("max_incoming_size_bytes") && j["max_incoming_size_bytes"].is_number_unsigned()) {
+            m_maxIncomingSizeBytes = j["max_incoming_size_bytes"].get<uint64_t>();
+        } else if (j.contains("max_incoming_size_bytes") && j["max_incoming_size_bytes"].is_number_integer()) {
+            const int64_t v = j["max_incoming_size_bytes"].get<int64_t>();
+            if (v > 0) {
+                m_maxIncomingSizeBytes = static_cast<uint64_t>(v);
+            }
+        }
+
         m_settingsLoaded = true;
         return true;
 
@@ -266,6 +340,7 @@ bool SettingsManager::saveSettings()
     j["window_geometry"] = m_windowGeometry.toBase64().toStdString();
     j["show_close_warning"] = m_showCloseWarning;
     j["peer_timeout"] = m_peerTimeout;
+    j["max_incoming_size_bytes"] = m_maxIncomingSizeBytes;
 
     // Save auto-accept preferences
     json autoAcceptObj;
@@ -273,6 +348,9 @@ bool SettingsManager::saveSettings()
         autoAcceptObj[it.key().toStdString()] = it.value();
     }
     j["auto_accept_peers"] = autoAcceptObj;
+
+    // Save trust store
+    j["trust_store"] = m_trustStore.toJson();
 
     // Get JSON string
     std::string jsonString = j.dump(4);  // 4-space indentation for readability
@@ -341,6 +419,9 @@ void SettingsManager::resetToDefaults()
 
     // Reset peer timeout to default
     m_peerTimeout = 10;  // Default 10 seconds (matches DiscoveryService PEER_TIMEOUT_MS)
+
+    // Default max incoming size
+    m_maxIncomingSizeBytes = ExoSend::DEFAULT_MAX_INCOMING_SIZE_BYTES;
 }
 
 // ========================================================================

@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ExoSend VERSION 0.1.0 LANGUAGES CXX)
+project(ExoSend VERSION 0.2.0 LANGUAGES CXX)
 
 # Fail fast on Windows if the configured compiler is not MSVC.
 if(WIN32 AND NOT MSVC)
@@ -39,8 +39,13 @@ add_executable(echo_client
     src/cmd/echo_client.cpp
 )
 
+add_executable(ExoSendFirewallHelper
+    src/cmd/firewall_helper.cpp
+)
+
 target_link_libraries(echo_server PRIVATE ws2_32)
 target_link_libraries(echo_client PRIVATE ws2_32)
+target_link_libraries(ExoSendFirewallHelper PRIVATE ole32 oleaut32)
 
 # ============================================
 # Core Library
@@ -54,6 +59,7 @@ add_library(exosend-core STATIC
     src/core/TransferQueueManager.cpp
     src/core/TlsSocket.cpp
     src/core/CertificateManager.cpp
+    src/core/TrustStore.cpp
     src/core/ThreadSafeLog.cpp
 )
 
@@ -63,6 +69,7 @@ target_include_directories(exosend-core PUBLIC
 
 target_link_libraries(exosend-core PUBLIC
     Ws2_32
+    Bcrypt
     nlohmann_json::nlohmann_json
     OpenSSL::Crypto
     OpenSSL::SSL
@@ -98,7 +105,6 @@ set(GUI_SOURCES
     src/gui/IncomingTransferDialog.cpp
     src/gui/CloseWarningDialog.cpp
     src/gui/CrashHandler.cpp
-    resources.qrc
 )
 
 set(GUI_HEADERS
@@ -137,11 +143,28 @@ if(MSVC)
     )
 endif()
 
-# Enable MOC for Qt signals/slots
-set_target_properties(ExoSend PROPERTIES
-    AUTOMOC ON
-    AUTOUIC ON
-    AUTORCC ON
+# Explicit Qt code generation (MOC/RCC). No .ui files are used, so UIC is not needed.
+set(EXOSEND_MOC_HEADERS
+    include/exosend/QtUi/CloseWarningDialog.h
+    include/exosend/QtUi/DragDropListView.h
+    include/exosend/QtUi/IncomingTransferDialog.h
+    include/exosend/QtUi/MainWindow.h
+    include/exosend/QtUi/PeerListItemDelegate.h
+    include/exosend/QtUi/PeerListModel.h
+    include/exosend/QtUi/SettingsDialog.h
+    include/exosend/QtUi/SettingsManager.h
+    include/exosend/QtUi/TransferListModel.h
+    include/exosend/QtUi/TrayIcon.h
+)
+qt6_wrap_cpp(EXOSEND_MOC_SOURCES ${EXOSEND_MOC_HEADERS})
+qt6_add_resources(EXOSEND_QRC_SOURCES resources.qrc)
+
+# Avoid CMake AutoMoc/AutoRcc path. In some constrained environments, CMake's
+# cmake_autogen step cannot spawn moc.exe (libuv EPERM). Add generated sources
+# explicitly via target_sources.
+target_sources(ExoSend PRIVATE
+    ${EXOSEND_MOC_SOURCES}
+    ${EXOSEND_QRC_SOURCES}
 )
 
 # Windows: Console application (enabled for debugging)
@@ -206,6 +229,7 @@ endif()
 # Installation
 # ============================================
 install(TARGETS echo_server echo_client discovery_test file_send_test file_receive_test server_test ExoSend
+    ExoSendFirewallHelper
     RUNTIME DESTINATION bin
 )
 

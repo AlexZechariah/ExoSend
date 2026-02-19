@@ -4,6 +4,7 @@
  */
 
 #include "exosend/TlsSocket.h"
+#include "exosend/FingerprintUtils.h"
 #include "exosend/CertificateManager.h"
 #include <openssl/ssl.h>
 #include <openssl/err.h>
@@ -181,25 +182,27 @@ bool TlsSocket::createContext(std::string& errorMsg) {
 }
 
 bool TlsSocket::configureVerification(std::string& errorMsg) {
+    (void)errorMsg;
+
+    // Peer-to-peer: require a certificate from the peer, but accept self-signed
+    // certificates at the OpenSSL layer. Pairing and pinning is enforced by the app
+    // by comparing the peer fingerprint against the persisted trust store.
+    int mode = SSL_VERIFY_PEER;
     if (m_role == TlsRole::SERVER) {
-        // Server: Don't verify client certificate
-        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_NONE, nullptr);
-    } else {
-        // Client: Verify server certificate, accept self-signed
-        SSL_CTX_set_verify(m_ctx, SSL_VERIFY_PEER, tlsVerifyCallback);
-        SSL_CTX_set_verify_depth(m_ctx, 0);
+        mode |= SSL_VERIFY_FAIL_IF_NO_PEER_CERT;
     }
+    SSL_CTX_set_verify(m_ctx, mode, tlsVerifyCallback);
+    SSL_CTX_set_verify_depth(m_ctx, 0);
 
     return true;
 }
 
 bool TlsSocket::loadCertificates(std::string& errorMsg) {
-    // Only server mode loads certificates
-    if (m_role != TlsRole::SERVER) {
-        return true;
+    // Both client and server present certificates for mutual authentication.
+    if (!CertificateManager::ensureCertificateExists(errorMsg)) {
+        return false;
     }
 
-    // Use CertificateManager to load certificates
     std::string certPath = CertificateManager::getCertFilePath();
     std::string keyPath = CertificateManager::getKeyFilePath();
 
@@ -261,6 +264,14 @@ bool TlsSocket::handshake(std::string& errorMsg) {
         errorMsg = "TLS handshake failed (" + getErrorDescription(err) + "): " + getLastError();
         return false;
     }
+
+    // Ensure peer presented a certificate (required for pinning)
+    X509* peerCert = SSL_get_peer_certificate(m_ssl);
+    if (!peerCert) {
+        errorMsg = "TLS handshake succeeded but peer did not present a certificate";
+        return false;
+    }
+    X509_free(peerCert);
 
     m_connected = true;
     m_initialized = true;
@@ -428,28 +439,17 @@ std::string TlsSocket::getPeerFingerprint(std::string& errorMsg) {
     SHA256(der, static_cast<size_t>(derLen), hash);
     OPENSSL_free(der);
 
-    // Convert to hex string
+    // Convert to canonical hex string (64 uppercase hex, no separators)
     std::string fingerprint;
     fingerprint.reserve(SHA256_DIGEST_LENGTH * 2);
     for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
         char buf[3];
-        snprintf(buf, sizeof(buf), "%02x", hash[i]);
+        snprintf(buf, sizeof(buf), "%02X", hash[i]);
         fingerprint += buf;
-
-        // Add colon for readability (except last byte)
-        if (i < SHA256_DIGEST_LENGTH - 1) {
-            fingerprint += ":";
-        }
     }
 
-    // Convert to uppercase
-    for (char& c : fingerprint) {
-        if (c >= 'a' && c <= 'f') {
-            c = c - 'a' + 'A';
-        }
-    }
-
-    return fingerprint;
+    // Defensive: enforce canonical form even if formatting changes later.
+    return FingerprintUtils::normalizeSha256Hex(fingerprint);
 }
 
 std::string TlsSocket::getPeerCommonName(std::string& errorMsg) {

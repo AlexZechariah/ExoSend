@@ -18,13 +18,15 @@ namespace ExoSend {
  * @brief Construct queue manager
  * @param maxConcurrent Maximum concurrent transfers
  */
-TransferQueueManager::TransferQueueManager(size_t maxConcurrent)
+TransferQueueManager::TransferQueueManager(size_t maxConcurrent, RequestRunner runner)
     : m_maxConcurrent(maxConcurrent)
     , m_running(false)
     , m_stopRequested(false)
     , m_activeCount(0)
     , m_downloadDir(".")
+    , m_localDeviceUuid()
     , m_completionCallback(nullptr)
+    , m_requestRunner(std::move(runner))
 {
 }
 
@@ -92,6 +94,7 @@ void TransferQueueManager::stop() {
     m_queueCV.notify_all();
 
     // Cancel all active sessions
+    std::unordered_map<std::string, std::unique_ptr<TransferSession>> sessionsToDestroy;
     {
         std::lock_guard<std::mutex> lock(m_queueMutex);
         for (auto& pair : m_activeSessions) {
@@ -99,7 +102,7 @@ void TransferQueueManager::stop() {
                 pair.second->cancel();
             }
         }
-        m_activeSessions.clear();
+        sessionsToDestroy.swap(m_activeSessions);
         m_activeRequests.clear();
         m_activeCount.store(0);
     }
@@ -219,16 +222,6 @@ void TransferQueueManager::workerThreadFunc(size_t workerIndex) {
                 continue;
             }
 
-            // Check concurrency limit
-            if (m_activeCount.load() >= m_maxConcurrent) {
-                // Put request back at the front
-                m_queue.push(request);
-                // Sleep a bit before retrying
-                lock.unlock();
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                continue;
-            }
-
             // Increment active count
             m_activeCount.fetch_add(1);
 
@@ -237,7 +230,9 @@ void TransferQueueManager::workerThreadFunc(size_t workerIndex) {
         }
 
         // Process the request (outside lock)
-        bool success = processRequest(request);
+        std::string sessionId;
+        std::string requestError;
+        bool success = processRequest(request, sessionId, requestError);
 
         // Update active count
         m_activeCount.fetch_sub(1);
@@ -250,8 +245,7 @@ void TransferQueueManager::workerThreadFunc(size_t workerIndex) {
 
         // Notify completion callback
         if (m_completionCallback) {
-            std::string sessionId;  // We don't track session ID in this implementation
-            m_completionCallback(request.requestId, success, sessionId, "");
+            m_completionCallback(request.requestId, success, sessionId, requestError);
         }
 
         // Notify next worker (there might be room now)
@@ -263,10 +257,26 @@ void TransferQueueManager::workerThreadFunc(size_t workerIndex) {
 // TransferQueueManager: processRequest()
 //=============================================================================
 
-bool TransferQueueManager::processRequest(const TransferRequest& request) {
+bool TransferQueueManager::processRequest(const TransferRequest& request, std::string& sessionId, std::string& errorMessage) {
     auto errorMsg = std::make_shared<std::string>();
 
     try {
+        if (m_requestRunner) {
+            std::string runnerError;
+            const bool ok = m_requestRunner(request, sessionId, runnerError);
+            if (!ok) {
+                *errorMsg = runnerError;
+            }
+            errorMessage = *errorMsg;
+            return ok;
+        }
+
+        std::mutex doneMutex;
+        std::condition_variable doneCv;
+        bool done = false;
+        bool ok = false;
+        std::string completionError;
+
         // Create OUTGOING TransferSession
         auto session = std::make_unique<TransferSession>(
             request.filePath,
@@ -279,15 +289,28 @@ bool TransferQueueManager::processRequest(const TransferRequest& request) {
             // Progress callback - forward to GUI
             m_progressCallback,
             // Completion callback
-            [errorMsg](const std::string& sessionId, bool success, const std::string& error) {
-                (void)sessionId;  // Unused
+            [errorMsg, &doneMutex, &doneCv, &done, &ok, &sessionId, &completionError](
+                const std::string& completedSessionId, bool success, const std::string& error) {
                 if (!success) {
                     *errorMsg = error;
                 }
+
+                {
+                    std::lock_guard<std::mutex> lock(doneMutex);
+                    done = true;
+                    ok = success;
+                    sessionId = completedSessionId;
+                    completionError = error;
+                }
+                doneCv.notify_one();
             }
         );
 
-        const std::string sessionId = session->getSessionId();
+        session->setRequireTls(true);
+        session->setLocalDeviceUuid(m_localDeviceUuid);
+        session->setPeerIdentity(request.peerUuid, request.peerPinnedFingerprintSha256Hex);
+
+        sessionId = session->getSessionId();
 
         // Add to active sessions map (for cancellation)
         {
@@ -305,18 +328,41 @@ bool TransferQueueManager::processRequest(const TransferRequest& request) {
             }
         }
 
-        if (sessionPtr) {
-            // Run the transfer (non-blocking - TransferSession runs in its own thread)
-            return sessionPtr->run();
+        if (!sessionPtr) {
+            errorMessage = "Failed to resolve active session pointer";
+            return false;
         }
 
-        return false;
+        // Start the transfer
+        if (!sessionPtr->run()) {
+            completionError = "Failed to start transfer session";
+            *errorMsg = completionError;
+            errorMessage = *errorMsg;
+            return false;
+        }
+
+        // Wait for completion
+        {
+            std::unique_lock<std::mutex> lock(doneMutex);
+            doneCv.wait(lock, [&] { return done || m_stopRequested.load(); });
+        }
+
+        // Remove from active sessions map after completion
+        {
+            std::lock_guard<std::mutex> lock(m_queueMutex);
+            m_activeSessions.erase(request.requestId);
+        }
+
+        errorMessage = completionError.empty() ? *errorMsg : completionError;
+        return ok;
 
     } catch (const std::exception& e) {
         *errorMsg = e.what();
+        errorMessage = *errorMsg;
         return false;
     } catch (...) {
         *errorMsg = "Unknown exception";
+        errorMessage = *errorMsg;
         return false;
     }
 }

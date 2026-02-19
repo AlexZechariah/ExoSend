@@ -19,6 +19,7 @@
 #include <QPushButton>
 #include <QDialogButtonBox>
 #include <QCheckBox>
+#include <QtGlobal>
 
 /**
  * @class IncomingTransferDialog
@@ -32,7 +33,7 @@
  *
  * Usage:
  * ```cpp
- * IncomingTransferDialog dlg(peerName, filename, fileSize, downloadPath, this);
+ * IncomingTransferDialog dlg(peerName, peerIp, peerUuid, peerPort, filename, fileSize, downloadPath, this);
  * if (dlg.exec() == QDialog::Accepted) {
  *     QString savePath = dlg.getDownloadPath();
  *     // Proceed with transfer
@@ -48,18 +49,20 @@ public:
      * @param peerName Name of the peer sending the file
      * @param peerIp IP address of the peer
      * @param peerUuid UUID of the peer
+     * @param peerPort TCP port of the peer (0 if unknown)
      * @param filename Name of the file being sent
      * @param fileSize Size of the file in bytes
      * @param defaultPath Default download directory
      * @param parent Parent widget
      */
     explicit IncomingTransferDialog(const QString& peerName,
-                                   const QString& peerIp,
-                                   const QString& peerUuid,
-                                   const QString& filename,
-                                   qint64 fileSize,
-                                   const QString& defaultPath,
-                                   QWidget* parent = nullptr);
+                                    const QString& peerIp,
+                                    const QString& peerUuid,
+                                    quint16 peerPort,
+                                    const QString& filename,
+                                    qint64 fileSize,
+                                    const QString& defaultPath,
+                                    QWidget* parent = nullptr);
 
     /**
      * @brief Destructor
@@ -133,6 +136,7 @@ private:
     QString m_peerName;       ///< Name of sender
     QString m_peerIp;         ///< IP address of sender
     QString m_peerUuid;       ///< UUID of sender
+    quint16 m_peerPort;       ///< TCP port of sender (0 if unknown)
     QString m_filename;       ///< File name
     qint64 m_fileSize;        ///< File size in bytes
     bool m_accepted;          ///< true if user accepted

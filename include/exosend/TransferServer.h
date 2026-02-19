@@ -19,6 +19,7 @@
 #include <future>
 #include <mutex>
 #include <condition_variable>
+#include <cstdint>
 
 namespace ExoSend {
 
@@ -63,7 +64,8 @@ struct PendingConnection {
  */
 using IncomingConnectionCallback = std::function<bool(const std::string& clientIp,
                                                         const ExoHeader& header,
-                                                        const std::string& pendingSessionId)>;
+                                                        const std::string& pendingSessionId,
+                                                        const std::string& peerFingerprintSha256Hex)>;
 
 //=============================================================================
 // TransferServer Class
@@ -206,6 +208,13 @@ public:
     }
 
     /**
+     * @brief Set maximum allowed incoming offer size (bytes)
+     *
+     * Offers larger than this are rejected before prompting the user.
+     */
+    void setMaxIncomingSizeBytes(uint64_t bytes) { m_maxIncomingSizeBytes = bytes; }
+
+    /**
      * @brief Get the download directory
      * @return Current download directory
      */
@@ -312,6 +321,7 @@ private:
     // Configuration
     uint16_t m_port;              ///< TCP listening port
     std::string m_downloadDir;    ///< Download directory for incoming files
+    uint64_t m_maxIncomingSizeBytes; ///< Maximum allowed incoming offer size (bytes)
 
     // Socket
     SOCKET m_listenSocket;        ///< Listening socket

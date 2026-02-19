@@ -2,8 +2,11 @@ name: ExoSend Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -16,8 +19,129 @@ env:
   VCPKG_OVERLAY_PORTS: ${{ github.workspace }}\\vcpkg-overlays\\ports
 
 jobs:
+  decide:
+    name: Decide Release
+    runs-on: windows-latest
+
+    outputs:
+      do_release: ${{ steps.decide.outputs.do_release }}
+      tag: ${{ steps.decide.outputs.tag }}
+      version: ${{ steps.decide.outputs.version }}
+
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+        fetch-depth: 0
+
+    - name: Decide whether to publish
+      id: decide
+      env:
+        BEFORE_SHA: ${{ github.event.before }}
+        REF: ${{ github.ref }}
+        REF_NAME: ${{ github.ref_name }}
+        SHA: ${{ github.sha }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        function Parse-VersionFromCMakeText([string] $text) {
+          $pattern = 'project\s*\(\s*ExoSend\s+VERSION\s+([0-9]+)\.([0-9]+)\.([0-9]+)'
+          try {
+            [void][regex]::new($pattern)
+          } catch {
+            throw "Invalid version regex: $pattern. $($_.Exception.Message)"
+          }
+
+          if ($text -match $pattern) {
+            return @{
+              Major = [int]$Matches[1]
+              Minor = [int]$Matches[2]
+              Patch = [int]$Matches[3]
+              Version = "$($Matches[1]).$($Matches[2]).$($Matches[3])"
+            }
+          }
+          return $null
+        }
+
+        $isTagPush = $env:REF -like 'refs/tags/*'
+
+        $cmakeText = Get-Content -Path 'CMakeLists.txt' -Raw
+        $current = Parse-VersionFromCMakeText $cmakeText
+        if (-not $current) {
+          throw "Could not parse ExoSend VERSION from CMakeLists.txt."
+        }
+
+        $tag = if ($isTagPush) { $env:REF_NAME } else { "v$($current.Version)" }
+
+        git fetch --tags --force
+        if ($LASTEXITCODE -ne 0) {
+          throw "git fetch --tags failed with exit code $LASTEXITCODE."
+        }
+
+        $remoteTagExists = $false
+        $remoteTagLines = git ls-remote --tags origin ("refs/tags/" + $tag)
+        if ($LASTEXITCODE -ne 0) {
+          throw "git ls-remote failed with exit code $LASTEXITCODE."
+        }
+        if ($remoteTagLines) {
+          $remoteTagExists = $true
+        }
+
+        if ($isTagPush) {
+          Write-Host "Tag push detected ($tag). Publishing is enabled."
+          "do_release=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          "version=$($current.Version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+          exit 0
+        }
+
+        # Auto-publish policy (branch push):
+        # - Only publish when version is 0.x.0 (patch == 0)
+        # - Only publish when the version changed in this push compared to the previous remote HEAD
+        # - Only publish when the tag does not already exist on the remote
+        $isEligibleVersion = ($current.Major -eq 0) -and ($current.Patch -eq 0)
+
+        $prevVersion = $null
+        $before = $env:BEFORE_SHA
+        if (-not [string]::IsNullOrWhiteSpace($before) -and ($before -notmatch '^0+$')) {
+          $prevCmake = (git show ($before + ":CMakeLists.txt")) 2>$null
+          if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($prevCmake)) {
+            $prevParsed = Parse-VersionFromCMakeText $prevCmake
+            if ($prevParsed) {
+              $prevVersion = $prevParsed.Version
+            }
+          } else {
+            # Ensure a tolerated lookup failure cannot poison the step exit code.
+            $LASTEXITCODE = 0
+          }
+        }
+
+        $versionChanged = $true
+        if ($prevVersion -and ($prevVersion -eq $current.Version)) {
+          $versionChanged = $false
+        }
+
+        $doRelease = $isEligibleVersion -and $versionChanged -and (-not $remoteTagExists)
+
+        Write-Host "Event: push to main"
+        Write-Host "Current version: $($current.Version)"
+        Write-Host "Previous version: $prevVersion"
+        Write-Host "Eligible version (0.x.0): $isEligibleVersion"
+        Write-Host "Version changed in push: $versionChanged"
+        Write-Host "Remote tag exists ($tag): $remoteTagExists"
+        Write-Host "Do release: $doRelease"
+
+        $doReleaseFlag = if ($doRelease) { 'true' } else { 'false' }
+        "do_release=$doReleaseFlag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "tag=$tag" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        "version=$($current.Version)" | Out-File -FilePath $env:GITHUB_OUTPUT -Append -Encoding utf8
+        exit 0
+
   build-and-release:
     name: Build and Publish (Windows)
+    needs: decide
+    if: needs.decide.outputs.do_release == 'true'
     runs-on: windows-latest
 
     steps:
@@ -28,6 +152,7 @@ jobs:
       uses: actions/checkout@v4
       with:
         submodules: recursive
+        fetch-depth: 0
 
     # =========================================================================
     # Validate Required vcpkg Overlay Files
@@ -161,6 +286,29 @@ jobs:
         ctest -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
 
     # =========================================================================
+    # Build Installer (Inno Setup)
+    # =========================================================================
+    - name: Install Inno Setup
+      run: |
+        choco install innosetup -y
+
+    - name: Build Installer
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $iscc = "${env:ProgramFiles(x86)}\\Inno Setup 6\\ISCC.exe"
+        if (-not (Test-Path $iscc)) {
+          throw "ISCC.exe not found at '$iscc'"
+        }
+
+        & $iscc "installers\\ExoSend.iss"
+
+        $installerPath = "build\\installer\\ExoSend Installer.exe"
+        if (-not (Test-Path $installerPath)) {
+          throw "Installer output not found at '$installerPath'"
+        }
+
+    # =========================================================================
     # Package Release ZIP
     # =========================================================================
     - name: Package ZIP
@@ -180,10 +328,27 @@ jobs:
         New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
 
         Copy-Item (Join-Path $buildDir "ExoSend.exe") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "ExoSendFirewallHelper.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "*.dll") $stageDir -Force
         Copy-Item (Join-Path $buildDir "platforms") $stageDir -Recurse -Force
-        if (Test-Path (Join-Path $buildDir "styles")) {
-          Copy-Item (Join-Path $buildDir "styles") $stageDir -Recurse -Force
+        Copy-Item (Join-Path $buildDir "styles") $stageDir -Recurse -Force
+
+        $required = @(
+          (Join-Path $stageDir "ExoSend.exe"),
+          (Join-Path $stageDir "ExoSendFirewallHelper.exe"),
+          (Join-Path $stageDir "Qt6Core.dll"),
+          (Join-Path $stageDir "Qt6Gui.dll"),
+          (Join-Path $stageDir "Qt6Widgets.dll"),
+          (Join-Path $stageDir "libcrypto-3-x64.dll"),
+          (Join-Path $stageDir "libssl-3-x64.dll"),
+          (Join-Path $stageDir "platforms\\qwindows.dll"),
+          (Join-Path $stageDir "styles\\qmodernwindowsstyle.dll")
+        )
+
+        $missing = $required | Where-Object { -not (Test-Path $_) }
+        if ($missing.Count -gt 0) {
+          $missing | ForEach-Object { Write-Host "Missing required runtime file: $_" }
+          throw "Deployment completeness check failed."
         }
 
         Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
@@ -200,12 +365,17 @@ jobs:
       run: |
         $ErrorActionPreference = 'Stop'
 
-        $tag = "${{ github.ref_name }}"
+        $tag = "${{ needs.decide.outputs.tag }}"
         $repo = "${{ github.repository }}"
+        $sha = "${{ github.sha }}"
         $zipPath = "dist/ExoSend.zip"
+        $installerPath = "build/installer/ExoSend Installer.exe"
 
         if (-not (Test-Path $zipPath)) {
           throw "ZIP not found at '$zipPath'"
+        }
+        if (-not (Test-Path $installerPath)) {
+          throw "Installer not found at '$installerPath'"
         }
 
         $prerelease = $false
@@ -217,13 +387,13 @@ jobs:
         $exists = ($LASTEXITCODE -eq 0)
 
         if (-not $exists) {
-          $args = @($tag, $zipPath, "--repo", $repo, "--generate-notes")
+          $args = @($tag, $zipPath, $installerPath, "--repo", $repo, "--generate-notes", "--target", $sha)
           if ($prerelease) {
             $args += "--prerelease"
           }
           gh release create @args
         } else {
-          gh release upload $tag $zipPath --repo $repo --clobber
+          gh release upload $tag $zipPath $installerPath --repo $repo --clobber
         }
 
     # =========================================================================

@@ -83,6 +83,9 @@ QVariant PeerListModel::data(const QModelIndex& index, int role) const
     case UuidRole:
         return QString::fromStdString(peer.uuid);
 
+    case FingerprintRole:
+        return QString::fromStdString(peer.certFingerprintSha256Hex);
+
     case StatusRole:
         return static_cast<int>(peer.getStatus(m_timeoutMs));
 
@@ -116,6 +119,7 @@ QHash<int, QByteArray> PeerListModel::roleNames() const
     // TimeRemainingRole removed - binary status doesn't show countdown
     roles[IsActiveRole] = "isActive";
     roles[AutoAcceptRole] = "autoAccept";
+    roles[FingerprintRole] = "fingerprint";
     return roles;
 }
 
@@ -363,6 +367,7 @@ QString PeerListModel::formatPeerTooltip(const ExoSend::PeerInfo& peer) const
     QString ip = QString::fromStdString(peer.ipAddress);
     uint port = peer.tcpPort;
     QString uuid = QString::fromStdString(peer.uuid);
+    QString fp = QString::fromStdString(peer.certFingerprintSha256Hex);
 
     // Calculate time since last seen
     auto now = std::chrono::steady_clock::now();
@@ -381,12 +386,18 @@ QString PeerListModel::formatPeerTooltip(const ExoSend::PeerInfo& peer) const
         timeAgo = QString("%1 hour%2 ago").arg(hours).arg(hours > 1 ? "s" : "");
     }
 
-    return QString("Name: %1\nIP: %2\nPort: %3\nUUID: %4\nLast seen: %5")
+    QString out = QString("Name: %1\nIP: %2\nPort: %3\nUUID: %4\nLast seen: %5")
         .arg(name)
         .arg(ip)
         .arg(port)
         .arg(uuid)
         .arg(timeAgo);
+
+    if (!fp.isEmpty()) {
+        out += "\nFingerprint (SHA-256): " + fp;
+    }
+
+    return out;
 }
 
 void PeerListModel::updatePeerStatuses(uint32_t timeoutMs)

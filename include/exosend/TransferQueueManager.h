@@ -37,6 +37,7 @@ struct TransferRequest {
     std::string peerUuid;         ///< UUID of the target peer
     std::string peerIpAddress;    ///< IP address of the target peer
     uint16_t peerPort;            ///< TCP port of the target peer
+    std::string peerPinnedFingerprintSha256Hex; ///< Pinned peer fingerprint for TLS pinning
     uint8_t priority;             ///< Priority level (0=low, 1=normal, 2=high)
     std::string requestId;        ///< Unique request identifier
 
@@ -142,6 +143,9 @@ using RequestCompletionCallback = std::function<void(
  */
 class TransferQueueManager {
 public:
+    using RequestRunner = std::function<bool(const TransferRequest& request,
+                                             std::string& sessionId,
+                                             std::string& errorMessage)>;
     /**
      * @brief Constructor
      * @param maxConcurrent Maximum number of concurrent transfers
@@ -149,7 +153,8 @@ public:
      * Creates a queue manager with the specified concurrency limit.
      * The manager is not started until start() is called.
      */
-    explicit TransferQueueManager(size_t maxConcurrent = MAX_CONCURRENT_TRANSFERS);
+    explicit TransferQueueManager(size_t maxConcurrent = MAX_CONCURRENT_TRANSFERS,
+                                  RequestRunner runner = nullptr);
 
     /**
      * @brief Destructor
@@ -261,6 +266,11 @@ public:
     }
 
     /**
+     * @brief Set local device UUID for outgoing offers (v0.2.0+)
+     */
+    void setLocalDeviceUuid(const std::string& uuid) { m_localDeviceUuid = uuid; }
+
+    /**
      * @brief Set status callback for session events
      * @param callback Function to call when session status changes
      *
@@ -297,11 +307,13 @@ private:
     /**
      * @brief Process a transfer request
      * @param request The request to process
+     * @param sessionId Output session ID (for tracking)
+     * @param errorMessage Output error message on failure
      * @return true if transfer succeeded
      *
      * Creates a TransferSession and runs the outgoing transfer.
      */
-    bool processRequest(const TransferRequest& request);
+    bool processRequest(const TransferRequest& request, std::string& sessionId, std::string& errorMessage);
 
     /**
      * @brief Generate a unique request ID
@@ -359,6 +371,7 @@ private:
 
     // Configuration
     std::string m_downloadDir;          ///< Download directory (for future use)
+    std::string m_localDeviceUuid;      ///< Local device UUID used in outgoing offers
 
     // Session event callbacks (for GUI updates)
     SessionStatusCallback m_statusCallback;
@@ -366,6 +379,7 @@ private:
 
     // Callbacks
     RequestCompletionCallback m_completionCallback;
+    RequestRunner m_requestRunner;
 };
 
 }  // namespace ExoSend

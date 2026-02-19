@@ -1,6 +1,6 @@
 {
   "name": "exosend",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Decentralized local file transfer system for Windows 10",
   "dependencies": [
     "nlohmann-json",

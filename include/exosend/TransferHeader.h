@@ -29,7 +29,12 @@ enum class PacketType : uint8_t {
     OFFER = 0x01,   ///< Sender offers a file for transfer
     ACCEPT = 0x02,  ///< Receiver accepts the file transfer
     REJECT = 0x03,  ///< Receiver rejects the file transfer
-    BUSY = 0x04     ///< Receiver is busy and cannot accept
+    BUSY = 0x04,    ///< Receiver is busy and cannot accept
+
+    // v0.2.0+ protocol extensions (no v0.1.0 compatibility by design)
+    HASH = 0x05,    ///< Sender sends final SHA-256 for verification
+    HASH_OK = 0x06, ///< Receiver confirms hash matched
+    HASH_BAD = 0x07 ///< Receiver reports hash mismatch
 };
 
 /**
@@ -56,6 +61,10 @@ enum class TransferState : uint8_t {
  * - Offset 15-270: Filename (256 bytes)
  * - Offset 271-511: Padding (241 bytes)
  *
+ * v0.2.0+ uses part of the padding region for additional metadata:
+ * - Padding[0..31]: SHA-256 bytes for PacketType::HASH
+ * - Padding[32..95]: Sender device UUID (null-terminated UTF-8)
+ *
  * All integer fields use network byte order (Big-Endian).
  * Use htonl/htons before sending and ntohl/ntohs after receiving.
  */
@@ -68,6 +77,12 @@ struct ExoHeader {
     char filename[256];          ///< UTF-8 filename (zero-padded)
     uint8_t padding[241];        ///< Zero-filled padding to make 512 bytes
 
+    // v0.2.0+ metadata stored in padding
+    static constexpr size_t SHA256_BYTES_LEN = 32;
+    static constexpr size_t SENDER_UUID_MAX_BYTES = 64;  // includes null terminator space
+    static constexpr size_t PADDING_SHA256_OFFSET = 0;
+    static constexpr size_t PADDING_SENDER_UUID_OFFSET = 32;
+
     /**
      * @brief Default constructor - initializes header to zeros
      */
@@ -77,7 +92,7 @@ struct ExoHeader {
 
     /**
      * @brief Create a header with specific values
-     * @param type Packet type (OFFER, ACCEPT, REJECT, BUSY)
+     * @param type Packet type (OFFER, ACCEPT, REJECT, BUSY, HASH, HASH_OK, HASH_BAD)
      * @param size File size in bytes
      * @param name Filename (will be truncated to 255 chars if needed)
      */
@@ -167,7 +182,7 @@ struct ExoHeader {
      *
      * Checks:
      * - Magic number matches 0x45584F53
-     * - Packet type is valid (0x01-0x04)
+     * - Packet type is valid (0x01-0x07)
      * - Filename length is <= 256
      */
     bool isValid() const {
@@ -176,7 +191,7 @@ struct ExoHeader {
         }
 
         if (packetType < static_cast<uint8_t>(PacketType::OFFER) ||
-            packetType > static_cast<uint8_t>(PacketType::BUSY)) {
+            packetType > static_cast<uint8_t>(PacketType::HASH_BAD)) {
             return false;
         }
 
@@ -209,9 +224,47 @@ struct ExoHeader {
                 return "REJECT";
             case PacketType::BUSY:
                 return "BUSY";
+            case PacketType::HASH:
+                return "HASH";
+            case PacketType::HASH_OK:
+                return "HASH_OK";
+            case PacketType::HASH_BAD:
+                return "HASH_BAD";
             default:
                 return "UNKNOWN";
         }
+    }
+
+    void setSha256Bytes(const uint8_t hash[SHA256_BYTES_LEN]) {
+        if (!hash) {
+            return;
+        }
+        std::memcpy(padding + PADDING_SHA256_OFFSET, hash, SHA256_BYTES_LEN);
+    }
+
+    std::array<uint8_t, SHA256_BYTES_LEN> getSha256Bytes() const {
+        std::array<uint8_t, SHA256_BYTES_LEN> out{};
+        std::memcpy(out.data(), padding + PADDING_SHA256_OFFSET, SHA256_BYTES_LEN);
+        return out;
+    }
+
+    void setSenderUuid(const std::string& uuid) {
+        const size_t maxCopy = SENDER_UUID_MAX_BYTES - 1;
+        const size_t copyLen = (uuid.size() < maxCopy) ? uuid.size() : maxCopy;
+
+        std::memset(padding + PADDING_SENDER_UUID_OFFSET, 0, SENDER_UUID_MAX_BYTES);
+        std::memcpy(padding + PADDING_SENDER_UUID_OFFSET, uuid.data(), copyLen);
+        padding[PADDING_SENDER_UUID_OFFSET + copyLen] = '\0';
+    }
+
+    std::string getSenderUuid() const {
+        const char* ptr = reinterpret_cast<const char*>(padding + PADDING_SENDER_UUID_OFFSET);
+        const size_t maxLen = SENDER_UUID_MAX_BYTES;
+        size_t len = 0;
+        while (len < maxLen && ptr[len] != '\0') {
+            ++len;
+        }
+        return std::string(ptr, len);
     }
 
     /**

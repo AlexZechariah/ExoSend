@@ -65,7 +65,8 @@ public:
         StatusRole = Qt::UserRole + 6,   ///< Peer status (int: Active=0, Warning=1, Inactive=2)
         TimeRemainingRole = Qt::UserRole + 7, ///< Seconds until timeout (0 if inactive)
         IsActiveRole = Qt::UserRole + 8,   ///< Boolean: true if peer is active (not inactive)
-        AutoAcceptRole = Qt::UserRole + 9   ///< Auto-accept enabled for this peer
+        AutoAcceptRole = Qt::UserRole + 9,  ///< Auto-accept enabled for this peer
+        FingerprintRole = Qt::UserRole + 10 ///< Peer cert fingerprint (SHA-256 hex) for pairing UX
     };
 
     /**

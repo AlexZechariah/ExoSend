@@ -8,6 +8,8 @@
 #include "exosend/PeerInfo.h"
 #include "exosend/UuidGenerator.h"
 #include "exosend/FileTransfer.h"
+#include "exosend/TlsSocket.h"
+#include "exosend/TransportStream.h"
 #include "exosend/Debug.h"
 #include "exosend/ThreadSafeLog.h"
 #include <iostream>
@@ -27,6 +29,12 @@ namespace ExoSend {
 namespace {
     // Thread-safe logging macro - uses ThreadSafeLog for all crash logging
     #define LogTransferCrash(msg) ExoSend::ThreadSafeLog::log(msg)
+
+    void tuneSocketBuffers(SOCKET socket) {
+        const int buf = 4 * 1024 * 1024;
+        (void)setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+        (void)setsockopt(socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+    }
 } // anonymous namespace
 
 //=============================================================================
@@ -337,7 +345,7 @@ void TransferSession::workerThreadFunc() {
 // TransferSession: runIncomingTransfer() - for INCOMING sessions
 //=============================================================================
 
-bool TransferSession::runIncomingTransfer(SOCKET socket, const ExoHeader& preReceivedHeader, std::string& errorMsg) {
+bool TransferSession::runIncomingTransfer(TransportStream& stream, const ExoHeader& preReceivedHeader, std::string& errorMsg) {
     // NOTE: Don't call setStatus() here - it triggers GUI callbacks from non-Qt thread
     // The TransferServer will handle status updates in the proper thread context
 
@@ -350,7 +358,7 @@ bool TransferSession::runIncomingTransfer(SOCKET socket, const ExoHeader& preRec
 
         // Receive file (pass pre-received header to avoid protocol mismatch)
         bool success = receiver.receiveFile(
-            socket,
+            stream,
             preReceivedHeader,  // Pass the already-received header
             errorMsg,
             // Accept callback: automatically accept incoming transfers
@@ -442,33 +450,80 @@ bool TransferSession::runOutgoingTransfer(std::string& errorMsg) {
             return false;
         }
 
-        setStatus(SessionStatus::TRANSFERRING);
-
-        // Create FileSender
-        FileSender sender(m_filePath);
-
-        // Update total bytes
-        m_totalBytes.store(sender.getFileSize());
+        tuneSocketBuffers(m_outgoingSocket);
 
         // Create throttled progress callback
         ThrottledProgress throttled(m_sessionId, m_progressCallback);
 
-        // Send file
-        bool success = sender.sendFile(
-            m_outgoingSocket,
-            errorMsg,
-            // Progress callback
-            [this, &throttled](uint64_t transferred, uint64_t total, double pct) {
-                m_bytesTransferred.store(transferred);
-                throttled(transferred, total, pct);
-            }
-        );
+        bool success = false;
 
-        if (success) {
-            m_sha256Hash = sender.getSha256Hash();
-            setStatus(SessionStatus::COMPLETED);
+        if (m_requireTls) {
+            // TLS handshake and pin verification
+            TlsSocket tls(m_outgoingSocket, TlsRole::CLIENT);
+            if (!tls.handshake(errorMsg)) {
+                closesocket(m_outgoingSocket);
+                m_outgoingSocket = INVALID_SOCKET;
+                return false;
+            }
+
+            std::string fpError;
+            const std::string peerFp = tls.getPeerFingerprint(fpError);
+            if (!m_expectedPeerFingerprintSha256Hex.empty()) {
+                if (peerFp.empty() || peerFp != m_expectedPeerFingerprintSha256Hex) {
+                    errorMsg = "Pinned fingerprint mismatch for peer '" + m_peerUuid +
+                               "'. Expected=" + m_expectedPeerFingerprintSha256Hex +
+                               " Actual=" + (peerFp.empty() ? "<empty>" : peerFp);
+                    closesocket(m_outgoingSocket);
+                    m_outgoingSocket = INVALID_SOCKET;
+                    return false;
+                }
+            } else {
+                errorMsg = "Unpaired peer '" + m_peerUuid + "' (no pinned fingerprint). Peer fingerprint=" +
+                           (peerFp.empty() ? "<empty>" : peerFp);
+                closesocket(m_outgoingSocket);
+                m_outgoingSocket = INVALID_SOCKET;
+                return false;
+            }
+
+            setStatus(SessionStatus::TRANSFERRING);
+
+            TlsTransportStream stream(tls);
+            FileSender sender(m_filePath, m_localDeviceUuid);
+
+            success = sender.sendFile(
+                stream,
+                errorMsg,
+                [this, &throttled](uint64_t transferred, uint64_t total, double pct) {
+                    m_bytesTransferred.store(transferred);
+                    m_totalBytes.store(total);
+                    throttled(transferred, total, pct);
+                }
+            );
+
+            if (success) {
+                m_sha256Hash = sender.getSha256Hash();
+            }
+
+            stream.shutdown();
         } else {
-            setStatus(SessionStatus::FAILED);
+            setStatus(SessionStatus::TRANSFERRING);
+
+            PlainSocketStream stream(m_outgoingSocket);
+            FileSender sender(m_filePath, m_localDeviceUuid);
+
+            success = sender.sendFile(
+                stream,
+                errorMsg,
+                [this, &throttled](uint64_t transferred, uint64_t total, double pct) {
+                    m_bytesTransferred.store(transferred);
+                    m_totalBytes.store(total);
+                    throttled(transferred, total, pct);
+                }
+            );
+
+            if (success) {
+                m_sha256Hash = sender.getSha256Hash();
+            }
         }
 
         // Close socket

@@ -15,12 +15,19 @@
 #include <ws2tcpip.h>
 #include <psapi.h>
 #include "exosend/config.h"
+#include "exosend/FileTransfer.h"
+#include "exosend/TransportStream.h"
+#include "exosend/TlsSocket.h"
+#include "exosend/CertificateManager.h"
 #include <iostream>
 #include <iomanip>
 #include <chrono>
 #include <string>
 #include <fstream>
 #include <vector>
+#include <thread>
+#include <filesystem>
+#include <future>
 
 //=============================================================================
 // Benchmark Results Structure
@@ -163,6 +170,216 @@ bool createTestFile(const std::string& path, uint64_t size) {
     return true;
 }
 
+namespace {
+
+struct SocketPair {
+    SOCKET client = INVALID_SOCKET;
+    SOCKET server = INVALID_SOCKET;
+    SOCKET listener = INVALID_SOCKET;
+    uint16_t port = 0;
+};
+
+static void closeSocketIfValid(SOCKET& s) {
+    if (s != INVALID_SOCKET) {
+        closesocket(s);
+        s = INVALID_SOCKET;
+    }
+}
+
+static bool createListener(SocketPair& sp, std::string& errorMsg) {
+    sp.listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sp.listener == INVALID_SOCKET) {
+        errorMsg = "socket() failed: " + std::to_string(WSAGetLastError());
+        return false;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+
+    if (bind(sp.listener, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        errorMsg = "bind() failed: " + std::to_string(WSAGetLastError());
+        return false;
+    }
+
+    if (listen(sp.listener, 1) == SOCKET_ERROR) {
+        errorMsg = "listen() failed: " + std::to_string(WSAGetLastError());
+        return false;
+    }
+
+    sockaddr_in bound{};
+    int boundLen = sizeof(bound);
+    if (getsockname(sp.listener, reinterpret_cast<sockaddr*>(&bound), &boundLen) == SOCKET_ERROR) {
+        errorMsg = "getsockname() failed: " + std::to_string(WSAGetLastError());
+        return false;
+    }
+
+    sp.port = ntohs(bound.sin_port);
+    return true;
+}
+
+static bool connectClient(SocketPair& sp, std::string& errorMsg) {
+    sp.client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sp.client == INVALID_SOCKET) {
+        errorMsg = "client socket() failed: " + std::to_string(WSAGetLastError());
+        return false;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(sp.port);
+
+    if (connect(sp.client, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        errorMsg = "connect() failed: " + std::to_string(WSAGetLastError());
+        return false;
+    }
+
+    return true;
+}
+
+static void tuneSocketBuffers(SOCKET socket) {
+    const int buf = 4 * 1024 * 1024;
+    (void)setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+    (void)setsockopt(socket, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&buf), sizeof(buf));
+}
+
+static BenchmarkResult benchmarkLoopbackTransfer(uint64_t fileSizeBytes, bool useTls) {
+    BenchmarkResult result{};
+    result.fileSize = fileSizeBytes;
+
+    const std::string sendPath = "benchmark_send.tmp";
+    const std::string outDir = "benchmark_out";
+
+    std::filesystem::create_directories(outDir);
+    std::remove(sendPath.c_str());
+    if (!createTestFile(sendPath, fileSizeBytes)) {
+        std::cerr << "Failed to create benchmark file.\n";
+        return result;
+    }
+
+    if (useTls) {
+        (void)SetEnvironmentVariableA("EXOSEND_CERT_DIR", ".\\benchmark_certs");
+        std::filesystem::create_directories("benchmark_certs");
+        std::string certErr;
+        if (!ExoSend::CertificateManager::ensureCertificateExists(certErr)) {
+            std::cerr << "Certificate generation failed: " << certErr << "\n";
+            return result;
+        }
+        ExoSend::initOpenSsl();
+    }
+
+    SocketPair sp;
+    std::string sockErr;
+    if (!createListener(sp, sockErr)) {
+        std::cerr << "Listener setup failed: " << sockErr << "\n";
+        closeSocketIfValid(sp.listener);
+        return result;
+    }
+
+    std::promise<bool> serverDone;
+    std::string serverErr;
+    std::string receivedPath;
+
+    std::thread serverThread([&]() {
+        sp.server = accept(sp.listener, nullptr, nullptr);
+        closeSocketIfValid(sp.listener);
+        if (sp.server == INVALID_SOCKET) {
+            serverErr = "accept() failed: " + std::to_string(WSAGetLastError());
+            serverDone.set_value(false);
+            return;
+        }
+
+        tuneSocketBuffers(sp.server);
+
+        ExoSend::FileReceiver receiver(outDir);
+        std::string err;
+        bool ok = false;
+
+        if (useTls) {
+            ExoSend::TlsSocket tls(sp.server, ExoSend::TlsRole::SERVER);
+            if (!tls.handshake(err)) {
+                serverErr = err;
+                serverDone.set_value(false);
+                return;
+            }
+            ExoSend::TlsTransportStream stream(tls);
+            ok = receiver.receiveFile(stream, err, [](const ExoSend::ExoHeader&) { return true; }, nullptr);
+            stream.shutdown();
+        } else {
+            ExoSend::PlainSocketStream stream(sp.server);
+            ok = receiver.receiveFile(stream, err, [](const ExoSend::ExoHeader&) { return true; }, nullptr);
+        }
+
+        serverErr = err;
+        receivedPath = receiver.getReceivedFilePath();
+        serverDone.set_value(ok);
+    });
+
+    if (!connectClient(sp, sockErr)) {
+        std::cerr << "Client connect failed: " << sockErr << "\n";
+        closeSocketIfValid(sp.client);
+        closeSocketIfValid(sp.listener);
+        serverThread.join();
+        return result;
+    }
+
+    tuneSocketBuffers(sp.client);
+
+    PerformanceMonitor monitor;
+    auto startTime = std::chrono::steady_clock::now();
+
+    std::string errorMsg;
+    bool ok = false;
+
+    if (useTls) {
+        ExoSend::TlsSocket tls(sp.client, ExoSend::TlsRole::CLIENT);
+        if (!tls.handshake(errorMsg)) {
+            ok = false;
+        } else {
+            ExoSend::TlsTransportStream stream(tls);
+            ExoSend::FileSender sender(sendPath, "");
+            ok = sender.sendFile(stream, errorMsg, nullptr);
+            stream.shutdown();
+        }
+    } else {
+        ExoSend::PlainSocketStream stream(sp.client);
+        ExoSend::FileSender sender(sendPath, "");
+        ok = sender.sendFile(stream, errorMsg, nullptr);
+    }
+
+    auto endTime = std::chrono::steady_clock::now();
+    const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count();
+
+    const bool serverOk = serverDone.get_future().get();
+    serverThread.join();
+
+    closeSocketIfValid(sp.client);
+    closeSocketIfValid(sp.server);
+
+    if (!receivedPath.empty()) {
+        std::remove(receivedPath.c_str());
+    }
+    std::remove(sendPath.c_str());
+
+    if (!ok || !serverOk) {
+        std::cerr << "Transfer failed. clientOk=" << ok << " serverOk=" << serverOk << "\n";
+        if (!errorMsg.empty()) std::cerr << "Client error: " << errorMsg << "\n";
+        if (!serverErr.empty()) std::cerr << "Server error: " << serverErr << "\n";
+        return result;
+    }
+
+    result.transferTimeMs = static_cast<uint64_t>(elapsedMs);
+    result.throughputMBps = (fileSizeBytes / (1024.0 * 1024.0)) / (elapsedMs / 1000.0);
+    result.cpuUsagePercent = monitor.getCpuUsage();
+    result.ramFootprintMB = monitor.getRamFootprintMB();
+
+    return result;
+}
+
+}  // namespace
+
 /**
  * @brief Benchmark SHA-256 hashing performance
  * @param dataSize Data size in bytes
@@ -282,6 +499,14 @@ int main(int argc, char* argv[]) {
     std::cout << "ExoSend Performance Benchmark Tool" << std::endl;
     std::cout << "==================================================" << std::endl;
 
+    bool enableTlsTransfer = false;
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        if (arg == "--tls") {
+            enableTlsTransfer = true;
+        }
+    }
+
     // Initialize Winsock
     WSADATA wsaData;
     WSAStartup(MAKEWORD(2, 2), &wsaData);
@@ -303,6 +528,16 @@ int main(int argc, char* argv[]) {
 
         // Benchmark hashing
         BenchmarkResult hashResult = benchmarkHashing(size);
+
+        std::cout << "\n=== Benchmarking Loopback Transfer (Plain TCP) ===" << std::endl;
+        BenchmarkResult plainTransfer = benchmarkLoopbackTransfer(size, false);
+        plainTransfer.print();
+
+        if (enableTlsTransfer) {
+            std::cout << "\n=== Benchmarking Loopback Transfer (TLS) ===" << std::endl;
+            BenchmarkResult tlsTransfer = benchmarkLoopbackTransfer(size, true);
+            tlsTransfer.print();
+        }
     }
 
     std::cout << "\n==================================================" << std::endl;

@@ -29,6 +29,7 @@ namespace ExoSend {
     struct PeerInfo {
         std::string uuid;                                           ///< Unique identifier for this peer
         std::string displayName;                                    ///< Human-readable device name
+        std::string certFingerprintSha256Hex;                       ///< Peer certificate fingerprint (SHA-256 hex)
         std::string ipAddress;                                      ///< IP address of the peer
         uint16_t tcpPort;                                           ///< TCP port where peer accepts transfers
         std::chrono::steady_clock::time_point lastSeen;            ///< Timestamp of last beacon received
@@ -36,8 +37,9 @@ namespace ExoSend {
         PeerInfo() : tcpPort(0), lastSeen(std::chrono::steady_clock::now()) {}
 
         PeerInfo(const std::string& uuid_, const std::string& name,
-                 const std::string& ip, uint16_t port)
-            : uuid(uuid_), displayName(name), ipAddress(ip),
+                 const std::string& ip, uint16_t port,
+                 const std::string& fingerprintSha256Hex = {})
+            : uuid(uuid_), displayName(name), certFingerprintSha256Hex(fingerprintSha256Hex), ipAddress(ip),
               tcpPort(port), lastSeen(std::chrono::steady_clock::now()) {}
 
         /**
