@@ -1,0 +1,276 @@
+name: ExoSend CI
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  BUILD_CONFIGURATION: Release
+  FEED_URL: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+  VCPKG_BINARY_SOURCES: 'clear;default,readwrite'
+  VCPKG_OVERLAY_PORTS: ${{ github.workspace }}\\vcpkg-overlays\\ports
+
+jobs:
+  build-and-test:
+    name: Build and Test (Windows)
+    runs-on: windows-latest
+
+    steps:
+    # =========================================================================
+    # Checkout Repository
+    # =========================================================================
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    # =========================================================================
+    # Validate Required vcpkg Overlay Files
+    # =========================================================================
+    - name: Validate vcpkg overlay files
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $required = @(
+          'vcpkg-overlays/ports/pcre2/portfile.cmake',
+          'vcpkg-overlays/ports/icu/portfile.cmake',
+          'vcpkg-overlays/ports/icu/vcpkg-cmake-wrapper.cmake',
+          'vcpkg-overlays/ports/pcre2/vcpkg.json',
+          'vcpkg-overlays/ports/icu/vcpkg.json'
+        )
+
+        $missing = $required | Where-Object { -not (Test-Path $_) }
+        if ($missing.Count -gt 0) {
+          $missing | ForEach-Object { Write-Host "Missing overlay file: $_" }
+          throw "Overlay preflight failed."
+        }
+
+        Write-Host "Overlay preflight passed."
+
+    # =========================================================================
+    # Setup vcpkg
+    # =========================================================================
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11
+      with:
+        vcpkgGitCommitId: '39922dbab0cafd7a7150d459c6a181c7dee5dfbe'
+        vcpkgJsonGlob: 'vcpkg.json'
+
+    # =========================================================================
+    # Cache vcpkg Dependencies
+    # =========================================================================
+    - name: Cache vcpkg Packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.VCPKG_ROOT }}/archives
+          ${{ env.VCPKG_ROOT }}/downloads
+          build/release/vcpkg_installed
+        key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-
+
+    # =========================================================================
+    # Configure vcpkg GitHub Packages binary caching (NuGet)
+    # =========================================================================
+    - name: Configure vcpkg binary cache (NuGet)
+      if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $vcpkgExe = Join-Path $env:VCPKG_ROOT 'vcpkg.exe'
+        if (-not (Test-Path $vcpkgExe)) {
+          throw "vcpkg.exe not found at '$vcpkgExe'"
+        }
+
+        $nugetExe = & $vcpkgExe fetch nuget
+        if (-not (Test-Path $nugetExe)) {
+          throw "nuget.exe not found at '$nugetExe'"
+        }
+        if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+          throw "GITHUB_TOKEN is empty; cannot configure NuGet binary cache."
+        }
+        if ([string]::IsNullOrWhiteSpace($env:FEED_URL)) {
+          throw "FEED_URL is empty; cannot configure NuGet binary cache."
+        }
+
+        $nugetConfigPath = Join-Path $env:RUNNER_TEMP 'vcpkg-nuget.config'
+        $feedUrlEscaped = [System.Security.SecurityElement]::Escape($env:FEED_URL)
+        $nugetConfigContent = @"
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <config>
+            <add key="defaultPushSource" value="$feedUrlEscaped" />
+          </config>
+          <packageSources>
+            <clear />
+            <add key="GitHub" value="$feedUrlEscaped" />
+          </packageSources>
+          <packageSourceCredentials>
+            <GitHub>
+              <add key="Username" value="%GITHUB_ACTOR%" />
+              <add key="ClearTextPassword" value="%GITHUB_TOKEN%" />
+            </GitHub>
+          </packageSourceCredentials>
+          <apikeys>
+            <add key="$feedUrlEscaped" value="%GITHUB_TOKEN%" />
+          </apikeys>
+        </configuration>
+        "@
+        [System.IO.File]::WriteAllText($nugetConfigPath, $nugetConfigContent, [System.Text.UTF8Encoding]::new($false))
+        "VCPKG_NUGET_CONFIG_PATH=$nugetConfigPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+        $access = 'readwrite'
+        if ($env:GITHUB_EVENT_NAME -eq 'pull_request') {
+          $access = 'read'
+        }
+
+        # Enable NuGet binary caching for subsequent steps (keep local 'default' as fallback).
+        "VCPKG_BINARY_SOURCES=clear;nugetconfig,$nugetConfigPath,$access;default,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    # =========================================================================
+    # Setup MSVC
+    # =========================================================================
+    - name: Setup MSVC
+      uses: microsoft/setup-msbuild@v2
+      with:
+        msbuild-architecture: x64
+
+    # =========================================================================
+    # Configure CMake
+    # =========================================================================
+    - name: Configure CMake
+      run: |
+        cmake --preset windows-release
+      env:
+        VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+
+    # =========================================================================
+    # Validate Resolved Compiler/Toolchain
+    # =========================================================================
+    - name: Validate CMake Compiler and Toolchain
+      run: |
+        $cachePath = "build/release/CMakeCache.txt"
+        if (-not (Test-Path $cachePath)) {
+          Write-Error "CMake cache not found at '$cachePath'. Configure step likely failed."
+          exit 1
+        }
+
+        $compilerLine = Select-String -Path $cachePath -Pattern '^CMAKE_CXX_COMPILER:(FILEPATH|PATH|STRING|UNINITIALIZED)=' | Select-Object -First 1
+        $toolchainLine = Select-String -Path $cachePath -Pattern '^CMAKE_TOOLCHAIN_FILE:(FILEPATH|PATH|STRING|UNINITIALIZED)=' | Select-Object -First 1
+        $compiler = $null
+
+        if ($compilerLine) {
+          $compiler = $compilerLine.Line.Split('=', 2)[1]
+        } else {
+          $compilerConfig = Get-ChildItem -Path "build/release/CMakeFiles" -Filter "CMakeCXXCompiler.cmake" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($compilerConfig) {
+            $compilerSetLine = Select-String -Path $compilerConfig.FullName -Pattern '^set\(CMAKE_CXX_COMPILER \"(.+?)\"\)$' | Select-Object -First 1
+            if ($compilerSetLine) {
+              $compiler = $compilerSetLine.Matches[0].Groups[1].Value
+            }
+          }
+        }
+
+        if (-not $compiler) {
+          Write-Error "CMAKE_CXX_COMPILER was not found in '$cachePath' or in CMakeCXXCompiler.cmake."
+          exit 1
+        }
+        if (-not $toolchainLine) {
+          Write-Error "CMAKE_TOOLCHAIN_FILE was not found in '$cachePath'."
+          exit 1
+        }
+        $toolchain = $toolchainLine.Line.Split('=', 2)[1]
+
+        Write-Host "Resolved CMAKE_CXX_COMPILER: $compiler"
+        Write-Host "Resolved CMAKE_TOOLCHAIN_FILE: $toolchain"
+
+        if ($compiler -notmatch '(?i)(^|[\\/])cl\.exe$') {
+          Write-Error "Expected MSVC compiler (cl.exe), got '$compiler'."
+          exit 1
+        }
+
+        if ($toolchain -notmatch '(?i)vcpkg\.cmake$') {
+          Write-Error "Expected vcpkg toolchain file ending in 'vcpkg.cmake', got '$toolchain'."
+          exit 1
+        }
+
+        Write-Host "Compiler and toolchain validation passed."
+
+    # =========================================================================
+    # Build Project
+    # =========================================================================
+    - name: Build ExoSend
+      run: |
+        cmake --build build/release --config ${{ env.BUILD_CONFIGURATION }} --parallel
+
+    # =========================================================================
+    # Run Unit Tests
+    # =========================================================================
+    - name: Run Unit Tests
+      working-directory: build/release
+      run: |
+        ctest -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
+
+    # =========================================================================
+    # Run Integration Tests
+    # =========================================================================
+    - name: Run Discovery Test
+      working-directory: build/release/bin/${{ env.BUILD_CONFIGURATION }}
+      run: |
+        Start-Process discovery_test.exe -NoNewWindow -PassThru | Out-Null
+        Start-Sleep -Seconds 5
+        Get-Process discovery_test -ErrorAction SilentlyContinue | Stop-Process
+
+    # =========================================================================
+    # Upload Build Artifacts
+    # =========================================================================
+    - name: Upload Executables
+      uses: actions/upload-artifact@v4
+      with:
+        name: ExoSend
+        path: |
+          build/release/bin/${{ env.BUILD_CONFIGURATION }}/ExoSend.exe
+          build/release/bin/${{ env.BUILD_CONFIGURATION }}/*.dll
+          build/release/bin/${{ env.BUILD_CONFIGURATION }}/platforms/
+        retention-days: 30
+
+    # =========================================================================
+    # Test Summary
+    # =========================================================================
+    - name: Test Summary
+      if: always()
+      run: |
+        Write-Host "============================================================"
+        Write-Host "Build Summary"
+        Write-Host "============================================================"
+        Write-Host "Configuration: ${{ env.BUILD_CONFIGURATION }}"
+        Write-Host "Platform: ${{ runner.os }}"
+        Write-Host "Compiler: MSVC"
+        Write-Host ""
+        Write-Host "Artifacts:"
+        Write-Host "  - ExoSend executable"
+        Write-Host "============================================================"
+
+    # =========================================================================
+    # Cleanup Temporary NuGet Config
+    # =========================================================================
+    - name: Cleanup temporary NuGet config
+      if: always()
+      run: |
+        $ErrorActionPreference = 'Continue'
+        if (-not [string]::IsNullOrWhiteSpace($env:VCPKG_NUGET_CONFIG_PATH) -and (Test-Path $env:VCPKG_NUGET_CONFIG_PATH)) {
+          Remove-Item -Path $env:VCPKG_NUGET_CONFIG_PATH -Force -ErrorAction Stop
+          Write-Host "Temporary NuGet config removed."
+        } else {
+          Write-Host "No temporary NuGet config to remove."
+        }

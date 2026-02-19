@@ -1,0 +1,61 @@
+# Build directories
+build/
+cmake-build-*/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake
+!CMakeLists.txt
+!vcpkg-overlays/**/*.cmake
+
+# Compiled binaries
+*.exe
+*.dll
+*.a
+*.lib
+*.so
+*.dylib
+
+# Exception: Track the VC++ Redistributable needed for installer
+!installers/VC_redist.x64.exe
+
+# Object files
+*.obj
+*.o
+*.ilk
+*.exp
+*.pdb
+
+# vcpkg (can be regenerated)
+vcpkg_installed/
+vcpkg/
+
+# Log files
+*.log
+build_installer.log
+
+# Qt generated files
+moc_*.cpp
+ui_*.h
+qrc_*.cpp
+*.autosave
+
+# IDE files
+.vs/
+.vscode/
+*.user
+*.suo
+*.vcxproj
+*.vcxproj.filters
+*.sln
+
+# Test results
+Testing/
+test_results/
+
+# User-specific
+*.swp
+*~
+.DS_Store

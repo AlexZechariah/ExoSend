@@ -1,0 +1,241 @@
+name: ExoSend Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+  packages: write
+
+env:
+  BUILD_CONFIGURATION: Release
+  FEED_URL: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
+  VCPKG_BINARY_SOURCES: 'clear;default,readwrite'
+  VCPKG_OVERLAY_PORTS: ${{ github.workspace }}\\vcpkg-overlays\\ports
+
+jobs:
+  build-and-release:
+    name: Build and Publish (Windows)
+    runs-on: windows-latest
+
+    steps:
+    # =========================================================================
+    # Checkout Repository
+    # =========================================================================
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+      with:
+        submodules: recursive
+
+    # =========================================================================
+    # Validate Required vcpkg Overlay Files
+    # =========================================================================
+    - name: Validate vcpkg overlay files
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $required = @(
+          'vcpkg-overlays/ports/pcre2/portfile.cmake',
+          'vcpkg-overlays/ports/icu/portfile.cmake',
+          'vcpkg-overlays/ports/icu/vcpkg-cmake-wrapper.cmake',
+          'vcpkg-overlays/ports/pcre2/vcpkg.json',
+          'vcpkg-overlays/ports/icu/vcpkg.json'
+        )
+
+        $missing = $required | Where-Object { -not (Test-Path $_) }
+        if ($missing.Count -gt 0) {
+          $missing | ForEach-Object { Write-Host "Missing overlay file: $_" }
+          throw "Overlay preflight failed."
+        }
+
+        Write-Host "Overlay preflight passed."
+
+    # =========================================================================
+    # Setup vcpkg
+    # =========================================================================
+    - name: Setup vcpkg
+      uses: lukka/run-vcpkg@v11
+      with:
+        vcpkgGitCommitId: '39922dbab0cafd7a7150d459c6a181c7dee5dfbe'
+        vcpkgJsonGlob: 'vcpkg.json'
+
+    # =========================================================================
+    # Cache vcpkg Dependencies
+    # =========================================================================
+    - name: Cache vcpkg Packages
+      uses: actions/cache@v4
+      with:
+        path: |
+          ${{ env.VCPKG_ROOT }}/archives
+          ${{ env.VCPKG_ROOT }}/downloads
+          build/release/vcpkg_installed
+        key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
+        restore-keys: |
+          ${{ runner.os }}-vcpkg-
+
+    # =========================================================================
+    # Configure vcpkg GitHub Packages binary caching (NuGet)
+    # =========================================================================
+    - name: Configure vcpkg binary cache (NuGet)
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $vcpkgExe = Join-Path $env:VCPKG_ROOT 'vcpkg.exe'
+        if (-not (Test-Path $vcpkgExe)) {
+          throw "vcpkg.exe not found at '$vcpkgExe'"
+        }
+
+        $nugetExe = & $vcpkgExe fetch nuget
+        if (-not (Test-Path $nugetExe)) {
+          throw "nuget.exe not found at '$nugetExe'"
+        }
+        if ([string]::IsNullOrWhiteSpace($env:GITHUB_TOKEN)) {
+          throw "GITHUB_TOKEN is empty; cannot configure NuGet binary cache."
+        }
+        if ([string]::IsNullOrWhiteSpace($env:FEED_URL)) {
+          throw "FEED_URL is empty; cannot configure NuGet binary cache."
+        }
+
+        $nugetConfigPath = Join-Path $env:RUNNER_TEMP 'vcpkg-nuget.config'
+        $feedUrlEscaped = [System.Security.SecurityElement]::Escape($env:FEED_URL)
+        $nugetConfigContent = @"
+        <?xml version="1.0" encoding="utf-8"?>
+        <configuration>
+          <config>
+            <add key="defaultPushSource" value="$feedUrlEscaped" />
+          </config>
+          <packageSources>
+            <clear />
+            <add key="GitHub" value="$feedUrlEscaped" />
+          </packageSources>
+          <packageSourceCredentials>
+            <GitHub>
+              <add key="Username" value="%GITHUB_ACTOR%" />
+              <add key="ClearTextPassword" value="%GITHUB_TOKEN%" />
+            </GitHub>
+          </packageSourceCredentials>
+          <apikeys>
+            <add key="$feedUrlEscaped" value="%GITHUB_TOKEN%" />
+          </apikeys>
+        </configuration>
+        "@
+        [System.IO.File]::WriteAllText($nugetConfigPath, $nugetConfigContent, [System.Text.UTF8Encoding]::new($false))
+        "VCPKG_NUGET_CONFIG_PATH=$nugetConfigPath" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+        "VCPKG_BINARY_SOURCES=clear;nugetconfig,$nugetConfigPath,readwrite;default,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+
+    # =========================================================================
+    # Setup MSVC
+    # =========================================================================
+    - name: Setup MSVC
+      uses: microsoft/setup-msbuild@v2
+      with:
+        msbuild-architecture: x64
+
+    # =========================================================================
+    # Configure CMake
+    # =========================================================================
+    - name: Configure CMake
+      run: |
+        cmake --preset windows-release
+      env:
+        VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
+
+    # =========================================================================
+    # Build Project
+    # =========================================================================
+    - name: Build ExoSend
+      run: |
+        cmake --build build/release --config ${{ env.BUILD_CONFIGURATION }} --parallel
+
+    # =========================================================================
+    # Run Unit Tests
+    # =========================================================================
+    - name: Run Unit Tests
+      working-directory: build/release
+      run: |
+        ctest -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
+
+    # =========================================================================
+    # Package Release ZIP
+    # =========================================================================
+    - name: Package ZIP
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $buildDir = "build/release/bin/${{ env.BUILD_CONFIGURATION }}"
+        $distDir = "dist"
+        $stageDir = Join-Path $distDir "ExoSend"
+        $zipPath = Join-Path $distDir "ExoSend.zip"
+
+        if (-not (Test-Path $buildDir)) {
+          throw "Build output directory not found: $buildDir"
+        }
+
+        Remove-Item -Recurse -Force $stageDir -ErrorAction SilentlyContinue
+        New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+
+        Copy-Item (Join-Path $buildDir "ExoSend.exe") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "*.dll") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "platforms") $stageDir -Recurse -Force
+        if (Test-Path (Join-Path $buildDir "styles")) {
+          Copy-Item (Join-Path $buildDir "styles") $stageDir -Recurse -Force
+        }
+
+        Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
+        Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath -Force
+
+        Write-Host "Created: $zipPath"
+
+    # =========================================================================
+    # Publish GitHub Release
+    # =========================================================================
+    - name: Publish GitHub Release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $tag = "${{ github.ref_name }}"
+        $repo = "${{ github.repository }}"
+        $zipPath = "dist/ExoSend.zip"
+
+        if (-not (Test-Path $zipPath)) {
+          throw "ZIP not found at '$zipPath'"
+        }
+
+        $prerelease = $false
+        if ($tag -match '^v0\\.') {
+          $prerelease = $true
+        }
+
+        gh release view $tag --repo $repo *> $null
+        $exists = ($LASTEXITCODE -eq 0)
+
+        if (-not $exists) {
+          $args = @($tag, $zipPath, "--repo", $repo, "--generate-notes")
+          if ($prerelease) {
+            $args += "--prerelease"
+          }
+          gh release create @args
+        } else {
+          gh release upload $tag $zipPath --repo $repo --clobber
+        }
+
+    # =========================================================================
+    # Cleanup Temporary NuGet Config
+    # =========================================================================
+    - name: Cleanup temporary NuGet config
+      if: always()
+      run: |
+        $ErrorActionPreference = 'Continue'
+        if (-not [string]::IsNullOrWhiteSpace($env:VCPKG_NUGET_CONFIG_PATH) -and (Test-Path $env:VCPKG_NUGET_CONFIG_PATH)) {
+          Remove-Item -Path $env:VCPKG_NUGET_CONFIG_PATH -Force -ErrorAction Stop
+          Write-Host "Temporary NuGet config removed."
+        } else {
+          Write-Host "No temporary NuGet config to remove."
+        }
