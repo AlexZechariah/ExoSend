@@ -15,7 +15,6 @@ env:
   BUILD_CONFIGURATION: Release
   FEED_URL: https://nuget.pkg.github.com/${{ github.repository_owner }}/index.json
   VCPKG_BINARY_SOURCES: 'clear;default,readwrite'
-  VCPKG_OVERLAY_PORTS: ${{ github.workspace }}\\vcpkg-overlays\\ports
 
 jobs:
   build-and-test:
@@ -32,27 +31,14 @@ jobs:
         submodules: recursive
 
     # =========================================================================
-    # Validate Required vcpkg Overlay Files
+    # Install Qt6 (pre-built MSVC 2022 x64 binaries - downloaded, not compiled)
     # =========================================================================
-    - name: Validate vcpkg overlay files
-      run: |
-        $ErrorActionPreference = 'Stop'
-
-        $required = @(
-          'vcpkg-overlays/ports/pcre2/portfile.cmake',
-          'vcpkg-overlays/ports/icu/portfile.cmake',
-          'vcpkg-overlays/ports/icu/vcpkg-cmake-wrapper.cmake',
-          'vcpkg-overlays/ports/pcre2/vcpkg.json',
-          'vcpkg-overlays/ports/icu/vcpkg.json'
-        )
-
-        $missing = $required | Where-Object { -not (Test-Path $_) }
-        if ($missing.Count -gt 0) {
-          $missing | ForEach-Object { Write-Host "Missing overlay file: $_" }
-          throw "Overlay preflight failed."
-        }
-
-        Write-Host "Overlay preflight passed."
+    - name: Install Qt6
+      uses: jurplel/install-qt-action@v4
+      with:
+        version: '6.8.*'
+        arch: 'win64_msvc2022_64'
+        cache: true
 
     # =========================================================================
     # Setup vcpkg
@@ -151,8 +137,6 @@ jobs:
     - name: Configure CMake
       run: |
         cmake --preset windows-release
-      env:
-        VCPKG_ROOT: ${{ env.VCPKG_ROOT }}
 
     # =========================================================================
     # Validate Resolved Compiler/Toolchain
@@ -246,6 +230,13 @@ jobs:
           $missing | ForEach-Object { Write-Host "Missing required runtime file: $_" }
           throw "Deployment completeness check failed."
         }
+
+        # Soft check: windeployqt deploys ICU DLLs; version suffix varies per Qt release
+        $icuCount = (Get-ChildItem -Path $buildDir -Filter "icu*.dll" -ErrorAction SilentlyContinue).Count
+        if ($icuCount -lt 3) {
+          Write-Warning "Expected >= 3 ICU DLLs from windeployqt, found: $icuCount."
+        }
+        Write-Host "Runtime deployment check passed."
 
     # =========================================================================
     # Package Release ZIP (CI artifact)

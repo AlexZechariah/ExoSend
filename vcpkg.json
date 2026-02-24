@@ -8,11 +8,6 @@
       "name": "openssl",
       "platform": "windows"
     },
-    {
-      "name": "qtbase",
-      "platform": "windows",
-      "features": ["widgets"]
-    },
     "gtest"
   ],
   "builtin-baseline": "39922dbab0cafd7a7150d459c6a181c7dee5dfbe"

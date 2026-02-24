@@ -167,53 +167,63 @@ target_sources(ExoSend PRIVATE
     ${EXOSEND_QRC_SOURCES}
 )
 
-# Windows: Console application (enabled for debugging)
+# Windows: GUI application + runtime deployment
 if(WIN32)
     set_target_properties(ExoSend PROPERTIES
         WIN32_EXECUTABLE TRUE
     )
 
-    # Deploy Qt dependencies - use CMAKE_BINARY_DIR for vcpkg paths with VS generator
-    # Try windeployqt first (for Release builds)
-	    find_program(WINDEPLOYQT_EXECUTABLE windeployqt
-	        HINTS "${CMAKE_BINARY_DIR}/vcpkg_installed/x64-windows/tools/Qt6/bin"
-	              "${CMAKE_SOURCE_DIR}/vcpkg_installed/x64-windows/tools/Qt6/bin"
-	    )
+    # Locate windeployqt from the officially installed Qt6.
+    # Qt6::qmake is exported by the Qt6 cmake package and lives in the same
+    # bin/ directory as windeployqt.
+    get_target_property(_qt_qmake_location Qt6::qmake IMPORTED_LOCATION)
+    get_filename_component(QT_BIN_DIR "${_qt_qmake_location}" DIRECTORY)
+    find_program(WINDEPLOYQT_EXECUTABLE windeployqt
+        HINTS "${QT_BIN_DIR}"
+        REQUIRED
+    )
+    message(STATUS "windeployqt: ${WINDEPLOYQT_EXECUTABLE}")
 
-	    # Manual DLL deployment as fallback (works with both Release and Debug)
-	    # Use vcpkg toolchain's resolved installed dir so builds work even when
-	    # VCPKG_INSTALLED_DIR is configured outside the build directory.
-	    set(_EXOSEND_VCPKG_INSTALLED_DIR "${VCPKG_INSTALLED_DIR}")
-	    if(NOT _EXOSEND_VCPKG_INSTALLED_DIR)
-	        set(_EXOSEND_VCPKG_INSTALLED_DIR "${CMAKE_BINARY_DIR}/vcpkg_installed")
-	    endif()
+    # Deploy all Qt DLLs, platform plugins, ICU, etc. using windeployqt.
+    # --release: deploy release-mode Qt DLLs only (no debug counterparts).
+    # --no-translations: skip QM translation files (English-only app).
+    # --no-system-d3d-compiler: not needed for a Widgets application.
+    add_custom_command(TARGET ExoSend POST_BUILD
+        COMMAND "${WINDEPLOYQT_EXECUTABLE}"
+            --release
+            --no-translations
+            --no-system-d3d-compiler
+            "$<TARGET_FILE:ExoSend>"
+        COMMENT "Running windeployqt to deploy Qt runtime..."
+    )
 
-	    add_custom_command(TARGET ExoSend POST_BUILD
-	        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ExoSend>/platforms"
-	        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ExoSend>/styles"
-	        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	            "${_EXOSEND_VCPKG_INSTALLED_DIR}/x64-windows/Qt6/plugins/platforms/qwindows.dll"
-	            "$<TARGET_FILE_DIR:ExoSend>/platforms/"
-	        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	            "${_EXOSEND_VCPKG_INSTALLED_DIR}/x64-windows/Qt6/plugins/styles/qmodernwindowsstyle.dll"
-	            "$<TARGET_FILE_DIR:ExoSend>/styles/"
-	        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	            "${_EXOSEND_VCPKG_INSTALLED_DIR}/x64-windows/bin/Qt6Core.dll"
-	            "$<TARGET_FILE_DIR:ExoSend>/"
-	        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	            "${_EXOSEND_VCPKG_INSTALLED_DIR}/x64-windows/bin/Qt6Gui.dll"
-	            "$<TARGET_FILE_DIR:ExoSend>/"
-	        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	            "${_EXOSEND_VCPKG_INSTALLED_DIR}/x64-windows/bin/Qt6Widgets.dll"
-	            "$<TARGET_FILE_DIR:ExoSend>/"
-	        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	            "${_EXOSEND_VCPKG_INSTALLED_DIR}/x64-windows/bin/libcrypto-3-x64.dll"
-	            "$<TARGET_FILE_DIR:ExoSend>/"
-	        COMMAND ${CMAKE_COMMAND} -E copy_if_different
-	            "${_EXOSEND_VCPKG_INSTALLED_DIR}/x64-windows/bin/libssl-3-x64.dll"
-	            "$<TARGET_FILE_DIR:ExoSend>/"
-	        COMMENT "Deploying Qt plugins and required DLLs..."
-	    )
+    # qmodernwindowsstyle.dll: style plugin not always auto-detected by
+    # windeployqt binary scanning. Explicitly copy it as a guaranteed step.
+    set(_QT_STYLES_DIR "${QT_BIN_DIR}/../plugins/styles")
+    cmake_path(NORMAL_PATH _QT_STYLES_DIR)
+    add_custom_command(TARGET ExoSend POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:ExoSend>/styles"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_QT_STYLES_DIR}/qmodernwindowsstyle.dll"
+            "$<TARGET_FILE_DIR:ExoSend>/styles/qmodernwindowsstyle.dll"
+        COMMENT "Deploying qmodernwindowsstyle plugin..."
+    )
+
+    # OpenSSL DLLs still come from vcpkg (not bundled with the Qt official installer).
+    set(_VCPKG_INSTALLED "${VCPKG_INSTALLED_DIR}")
+    if(NOT _VCPKG_INSTALLED)
+        set(_VCPKG_INSTALLED "${CMAKE_SOURCE_DIR}/vcpkg_installed")
+    endif()
+
+    add_custom_command(TARGET ExoSend POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_VCPKG_INSTALLED}/x64-windows/bin/libcrypto-3-x64.dll"
+            "$<TARGET_FILE_DIR:ExoSend>/libcrypto-3-x64.dll"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${_VCPKG_INSTALLED}/x64-windows/bin/libssl-3-x64.dll"
+            "$<TARGET_FILE_DIR:ExoSend>/libssl-3-x64.dll"
+        COMMENT "Deploying OpenSSL DLLs from vcpkg..."
+    )
 endif()
 
 # ============================================
