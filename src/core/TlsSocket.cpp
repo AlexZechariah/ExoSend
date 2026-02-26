@@ -148,15 +148,31 @@ bool TlsSocket::createContext(std::string& errorMsg) {
         return false;
     }
 
-    // Set minimum TLS version to 1.2
-    if (SSL_CTX_set_min_proto_version(m_ctx, TLS1_2_VERSION) != 1) {
+    // Maximum security: TLS 1.3 only (no legacy protocol negotiation).
+    if (SSL_CTX_set_min_proto_version(m_ctx, TLS1_3_VERSION) != 1) {
         errorMsg = "Failed to set minimum TLS version: " + getLastError();
         return false;
     }
+    if (SSL_CTX_set_max_proto_version(m_ctx, TLS1_3_VERSION) != 1) {
+        errorMsg = "Failed to set maximum TLS version: " + getLastError();
+        return false;
+    }
 
-    // Set strong cipher list
+    // TLS 1.3 cipher suites are configured separately from legacy ciphers.
+    if (SSL_CTX_set_ciphersuites(m_ctx, TLS13_CIPHER_SUITES) != 1) {
+        errorMsg = "Failed to set TLS 1.3 cipher suites: " + getLastError();
+        return false;
+    }
+
+    // Set strong cipher list (legacy API, retained for completeness even though
+    // TLS <= 1.2 is disabled by version policy).
     if (SSL_CTX_set_cipher_list(m_ctx, TLS_CIPHER_SUITE) != 1) {
         errorMsg = "Failed to set cipher list: " + getLastError();
+        return false;
+    }
+
+    if (SSL_CTX_set1_groups_list(m_ctx, TLS_GROUPS_LIST) != 1) {
+        errorMsg = "Failed to set TLS groups list: " + getLastError();
         return false;
     }
 
@@ -452,6 +468,40 @@ std::string TlsSocket::getPeerFingerprint(std::string& errorMsg) {
     return FingerprintUtils::normalizeSha256Hex(fingerprint);
 }
 
+std::string TlsSocket::getLocalFingerprint(std::string& errorMsg) {
+    if (!m_connected || !m_ssl) {
+        errorMsg = "TLS not connected";
+        return "";
+    }
+
+    X509* cert = SSL_get_certificate(m_ssl);
+    if (!cert) {
+        errorMsg = "No local certificate";
+        return "";
+    }
+
+    unsigned char* der = nullptr;
+    int derLen = i2d_X509(cert, &der);
+    if (derLen < 0) {
+        errorMsg = "Failed to encode certificate";
+        return "";
+    }
+
+    unsigned char hash[SHA256_DIGEST_LENGTH];
+    SHA256(der, static_cast<size_t>(derLen), hash);
+    OPENSSL_free(der);
+
+    std::string fingerprint;
+    fingerprint.reserve(SHA256_DIGEST_LENGTH * 2);
+    for (int i = 0; i < SHA256_DIGEST_LENGTH; ++i) {
+        char buf[3];
+        snprintf(buf, sizeof(buf), "%02X", hash[i]);
+        fingerprint += buf;
+    }
+
+    return FingerprintUtils::normalizeSha256Hex(fingerprint);
+}
+
 std::string TlsSocket::getPeerCommonName(std::string& errorMsg) {
     if (!m_connected || !m_ssl) {
         errorMsg = "TLS not connected";
@@ -484,6 +534,38 @@ std::string TlsSocket::getPeerCommonName(std::string& errorMsg) {
     }
 
     return std::string(cnBuffer, static_cast<size_t>(cnLen));
+}
+
+bool TlsSocket::getTlsExporterChannelBinding(std::array<uint8_t, 32>& out, std::string& errorMsg) const {
+    if (!m_connected || !m_ssl) {
+        errorMsg = "TLS not connected";
+        return false;
+    }
+
+    constexpr const char* kLabel = "EXPORTER-Channel-Binding";
+    std::fill(out.begin(), out.end(), 0);
+
+    // RFC 9266 defines the context as the empty string. OpenSSL exposes this
+    // via the use_context flag. Note: for TLS 1.2 and below, an omitted context
+    // differs from an empty context, so keep use_context=1 even with length 0.
+    static const unsigned char kEmptyContext[1] = { 0 };
+
+    const int ok = SSL_export_keying_material(
+        m_ssl,
+        out.data(),
+        out.size(),
+        kLabel,
+        std::strlen(kLabel),
+        kEmptyContext,
+        0,
+        1
+    );
+    if (ok != 1) {
+        errorMsg = "TLS exporter failed: " + getLastError();
+        return false;
+    }
+
+    return true;
 }
 
 //=============================================================================
@@ -525,34 +607,31 @@ std::string TlsSocket::getErrorDescription(int sslErrorCode) {
 //=============================================================================
 
 /**
- * @brief TLS certificate verification callback
+ * @brief TLS certificate verification callback (self-signed allowed, v0.3.0+)
  *
- * Accepts self-signed certificates for peer-to-peer transfers.
- * Uses Trust-On-First-Use (TOFU) model for certificate validation.
+ * Accepts self-signed certificates (X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN,
+ * X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT) to support peer-to-peer transfers
+ * without a CA. Rejects all other verification errors.
+ *
+ * Peer identity is enforced at the application layer by comparing the peer
+ * certificate fingerprint against the persisted trust store (pairing confirmation + pinning).
  */
 int tlsVerifyCallback(int preverifyOk, X509_STORE_CTX* ctx) {
-    // Get certificate
-    X509* cert = X509_STORE_CTX_get_current_cert(ctx);
     int depth = X509_STORE_CTX_get_error_depth(ctx);
     int err = X509_STORE_CTX_get_error(ctx);
-
-    // Suppress unused variable warning
     (void)depth;
 
-    // Accept self-signed certificates for peer-to-peer transfers
     if (!preverifyOk) {
-        char subject[256];
-        X509_NAME_oneline(X509_get_subject_name(cert), subject, sizeof(subject));
-
+        // Permit only self-signed certificate errors. Every other error is
+        // a genuine TLS failure and must be rejected to preserve trust semantics.
         if (err == X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN ||
             err == X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT) {
-            return 1;  // Accept self-signed certificates
+            return 1;  // Accept self-signed certificates (identity enforced at application layer)
         }
-
-        return 1;  // Accept certificate
+        return 0;  // Reject all other certificate errors
     }
 
-    return 1;  // Accept
+    return 1;  // Pre-verification passed
 }
 
 }  // namespace ExoSend

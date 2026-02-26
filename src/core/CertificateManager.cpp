@@ -5,6 +5,10 @@
 
 #include "exosend/CertificateManager.h"
 #include "exosend/FingerprintUtils.h"
+#include "exosend/WindowsAcl.h"
+#include "exosend/AppPaths.h"
+#include "exosend/MigrationUtils.h"
+#include "exosend/ThreadSafeLog.h"
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
 #include <openssl/pem.h>
@@ -61,17 +65,14 @@ std::string CertificateManager::getDefaultCertDir() {
 #endif
 
 #ifdef _WIN32
-    // Get %APPDATA% path
-    char appDataPath[MAX_PATH];
-    HRESULT hr = SHGetFolderPathA(nullptr, CSIDL_APPDATA, nullptr, 0, appDataPath);
-
-    if (hr == S_OK) {
-        std::string certDir = std::string(appDataPath);
-        // Normalize path separators
+    // Canonical location: %LOCALAPPDATA%\\ExoSend\\certs
+    const auto dir = ExoSend::AppPaths::certsDir();
+    if (!dir.empty()) {
+        std::string certDir = dir.u8string();
         for (char& c : certDir) {
             if (c == '\\') c = '/';
         }
-        return certDir + "/ExoSend/" + CERT_DIR;
+        return certDir;
     }
 #endif
 
@@ -146,6 +147,31 @@ bool CertificateManager::certificateExists(const std::string& certPath) {
 }
 
 bool CertificateManager::ensureCertificateExists(std::string& errorMsg) {
+#ifdef _WIN32
+    // One-time migration: older builds stored certs under %APPDATA%\ExoSend\certs\.
+    // Canonical location for v0.3.x is %LOCALAPPDATA%\ExoSend\certs\.
+    // Skip migration when EXOSEND_CERT_DIR override is used (dev/test).
+    {
+        DWORD required = GetEnvironmentVariableA("EXOSEND_CERT_DIR", nullptr, 0);
+        if (required <= 1) {
+            const auto destDir = ExoSend::AppPaths::certsDir();
+            const auto legacyDir = ExoSend::AppPaths::legacyRoamingCertsDir();
+            const auto r = ExoSend::MigrationUtils::migrateCertMaterialIfMissing(
+                destDir, legacyDir, CERT_FILE, KEY_FILE);
+            if (!r.ok) {
+                // Best-effort only; certificate generation below will still work.
+                ExoSend::ThreadSafeLog::log("CERT_MIGRATE_WARN: " + r.error);
+            } else if (r.migrated) {
+                std::wstring aclErr;
+                (void)restrictPathToCurrentUser(destDir.wstring(), &aclErr);
+                (void)restrictPathToCurrentUser((destDir / CERT_FILE).wstring(), &aclErr);
+                (void)restrictPathToCurrentUser((destDir / KEY_FILE).wstring(), &aclErr);
+                ExoSend::ThreadSafeLog::log("CERT_MIGRATE: migrated cert material to LocalAppData");
+            }
+        }
+    }
+#endif
+
     // Check if certificate already exists
     std::string certPath = getCertFilePath();
     std::string keyPath = getKeyFilePath();
@@ -300,6 +326,19 @@ bool CertificateManager::generateSelfSignedCert(const std::string& certPath,
             errorMsg = "Failed to write private key";
             goto cleanup;
         }
+
+#ifdef _WIN32
+        // Best-effort defense-in-depth: restrict cert/key ACLs to current user only.
+        // Failure is non-fatal because %APPDATA% is already user-scoped by default.
+        {
+            std::wstring aclErr;
+            const auto certDirW = std::filesystem::path(certPath).parent_path().wstring();
+            (void)restrictPathToCurrentUser(certDirW, &aclErr);
+
+            (void)restrictPathToCurrentUser(std::filesystem::path(certPath).wstring(), &aclErr);
+            (void)restrictPathToCurrentUser(std::filesystem::path(keyPath).wstring(), &aclErr);
+        }
+#endif
 
         success = true;
 

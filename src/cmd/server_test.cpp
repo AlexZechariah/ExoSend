@@ -162,7 +162,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    std::cout << "[INFO] Discovery Service started on UDP port " << DISCOVERY_PORT_DEFAULT << "\n";
+    std::cout << "[INFO] Discovery Service started on UDP port " << discovery.getBoundDiscoveryPort() << "\n";
     std::cout << "[INFO] Device UUID: " << discovery.getUuid() << "\n";
     std::cout << "[INFO] Display Name: " << discovery.getDisplayName() << "\n\n";
 

@@ -58,6 +58,14 @@ bool TrustStore::isPinnedFingerprintMatch(const std::string& peerUuid,
     return rec->pinnedFingerprintSha256Hex == fingerprintSha256Hex;
 }
 
+bool TrustStore::revokePeer(const std::string& peerUuid) {
+    return m_records.erase(peerUuid) > 0;
+}
+
+void TrustStore::clear() {
+    m_records.clear();
+}
+
 nlohmann::json TrustStore::toJson() const {
     nlohmann::json out = nlohmann::json::object();
     for (const auto& pair : m_records) {

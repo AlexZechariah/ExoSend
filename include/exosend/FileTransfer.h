@@ -16,6 +16,7 @@
 #include <functional>
 #include <fstream>
 #include <filesystem>
+#include "WinSafeFile.h"
 
 namespace ExoSend {
 
@@ -447,8 +448,13 @@ private:
     // Member variables
     std::string m_downloadDir;           ///< Destination directory
     std::string m_outputPath;            ///< Full path to output file
+    std::string m_tempOutputPath;        ///< Temp path used during atomic write
     std::string m_fileName;              ///< Just the filename
+#ifdef _WIN32
+    ScopedWinFile m_outputHandle;        ///< Output file handle (Win32)
+#else
     std::ofstream m_outputFile;          ///< Output file stream
+#endif
     uint64_t m_bytesReceived;            ///< Bytes received counter
     unsigned char m_sha256Hash[HASH_SIZE];  ///< Computed SHA-256 hash
     std::string m_sha256HashString;      ///< Hash as hex string

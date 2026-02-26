@@ -22,6 +22,7 @@
 #include <random>
 #include <iomanip>
 #include <algorithm>
+#include <chrono>
 #include <windows.h>
 
 // Undefine Windows macros that conflict with std::left, std::right, etc.
@@ -58,6 +59,7 @@ DiscoveryService::DiscoveryService()
     , m_tcpPort(TCP_PORT_DEFAULT)
     , m_udpSocket(INVALID_SOCKET)
     , m_socketInitialized(false)
+    , m_boundDiscoveryPort(0)
     , m_running(false)
     , m_stopRequested(false) {
     // Try to get hostname for display name
@@ -241,37 +243,73 @@ void DiscoveryService::setCertificateFingerprintSha256Hex(const std::string& fin
 //=============================================================================
 
 void DiscoveryService::transmitterThreadFunc() {
-    // Get all broadcast addresses at startup
+    // Properly seed mt19937 with full state_size draws from random_device.
+    // On MSVC, random_device is backed by BCryptGenRandom -- never blocks.
+    auto& rng = []() -> std::mt19937& {
+        std::array<std::mt19937::result_type, std::mt19937::state_size> seedData;
+        std::random_device rd;
+        std::generate(seedData.begin(), seedData.end(), std::ref(rd));
+        std::seed_seq seq(seedData.begin(), seedData.end());
+        thread_local std::mt19937 rng_(seq);
+        return rng_;
+    }();
+
+    // Get initial broadcast addresses.
     std::vector<std::string> broadcastAddresses = getBroadcastAddresses();
+    auto lastRefresh    = std::chrono::steady_clock::now();
+    int  burstRemaining = DISCOVERY_STARTUP_BURST_COUNT;
 
     while (!m_stopRequested.load()) {
-        // Generate and send beacon
+        // Generate beacon JSON (includes discovery_port, timestamp_ms, proto_version).
         std::string beacon = generateBeaconJson();
 
-        // Send to each broadcast address
-        for (const auto& broadcastIp : broadcastAddresses) {
-            sockaddr_in broadcastAddr;
-            broadcastAddr.sin_family = AF_INET;
-            broadcastAddr.sin_port = htons(DISCOVERY_PORT_DEFAULT);
-            inet_pton(AF_INET, broadcastIp.c_str(), &broadcastAddr.sin_addr);
-
-            sendto(
-                m_udpSocket,
-                beacon.c_str(),
-                static_cast<int>(beacon.length()),
-                0,
-                reinterpret_cast<sockaddr*>(&broadcastAddr),
-                sizeof(broadcastAddr)
-            );
+        // Send to EVERY port in the discovery pool x EVERY adapter broadcast address.
+        // This ensures peers bound to any pool port still receive our beacons.
+        for (uint16_t targetPort : DISCOVERY_POOL_PORTS) {
+            for (const auto& broadcastIp : broadcastAddresses) {
+                sockaddr_in broadcastAddr{};
+                broadcastAddr.sin_family = AF_INET;
+                broadcastAddr.sin_port   = htons(targetPort);
+                inet_pton(AF_INET, broadcastIp.c_str(), &broadcastAddr.sin_addr);
+                sendto(m_udpSocket,
+                       beacon.c_str(),
+                       static_cast<int>(beacon.length()),
+                       0,
+                       reinterpret_cast<sockaddr*>(&broadcastAddr),
+                       sizeof(broadcastAddr));
+            }
         }
 
-        // Wait for discovery interval or stop signal.
+        // Determine sleep interval: startup burst or steady state.
+        uint32_t baseIntervalMs;
+        if (burstRemaining > 0) {
+            baseIntervalMs = DISCOVERY_STARTUP_INTERVAL_MS;
+            --burstRemaining;
+        } else {
+            baseIntervalMs = DISCOVERY_INTERVAL_MS;
+        }
+
+        // Apply jitter: +/- BEACON_JITTER_MAX_PERCENT% of base interval.
+        // Desynchronises 100 simultaneous peers to prevent broadcast storms.
+        const int jitterRange = static_cast<int>(baseIntervalMs) *
+                                BEACON_JITTER_MAX_PERCENT / 100;
+        std::uniform_int_distribution<int> dist(-jitterRange, jitterRange);
+        const int sleepMs = (std::max)(500, static_cast<int>(baseIntervalMs) + dist(rng));
+
+        // Refresh broadcast adapter list if interval has elapsed.
+        // This handles VPN connect / WiFi roam / new NIC without restart.
+        const auto now = std::chrono::steady_clock::now();
+        if (std::chrono::duration_cast<std::chrono::seconds>(
+                now - lastRefresh).count() >= BROADCAST_REFRESH_INTERVAL_S) {
+            broadcastAddresses = getBroadcastAddresses();
+            lastRefresh        = now;
+        }
+
+        // Wait for the jittered interval or stop signal.
         std::unique_lock<std::mutex> waitLock(m_stopCvMutex);
-        m_stopCv.wait_for(
-            waitLock,
-            std::chrono::milliseconds(DISCOVERY_INTERVAL_MS),
-            [this]() { return m_stopRequested.load(); }
-        );
+        m_stopCv.wait_for(waitLock,
+                          std::chrono::milliseconds(sleepMs),
+                          [this]() { return m_stopRequested.load(); });
     }
 }
 
@@ -311,6 +349,12 @@ void DiscoveryService::listenerThreadFunc() {
             // Get sender IP address
             char senderIp[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &senderAddr.sin_addr, senderIp, INET_ADDRSTRLEN);
+
+            // Rate-limit check: drop flood packets BEFORE JSON parse to prevent
+            // CPU amplification from beacon flood attacks.
+            if (!m_rateLimiter.shouldProcess(senderIp)) {
+                continue;
+            }
 
             // Parse the beacon
             try {
@@ -360,12 +404,20 @@ void DiscoveryService::gcThreadFunc() {
 
 std::string DiscoveryService::generateBeaconJson() const {
     json beacon;
-    beacon["protocol_id"] = PROTOCOL_ID;
-    beacon["beacon_type"] = BEACON_TYPE_ANNOUNCE;  // Explicit beacon type
-    beacon["device_uuid"] = m_uuid;
-    beacon["display_name"] = m_displayName;
-    beacon["os_platform"] = OS_PLATFORM;
-    beacon["tcp_port"] = m_tcpPort;
+    beacon["protocol_id"]   = PROTOCOL_ID;
+    beacon["beacon_type"]   = BEACON_TYPE_ANNOUNCE;
+    beacon["device_uuid"]   = m_uuid;
+    beacon["display_name"]  = m_displayName;
+    beacon["os_platform"]   = OS_PLATFORM;
+    beacon["tcp_port"]      = m_tcpPort;
+
+    // v0.3 fields (new -- v0.2 parsers silently ignore unknown JSON keys).
+    beacon["discovery_port"] = m_boundDiscoveryPort;
+    beacon["timestamp_ms"]   = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    beacon["proto_version"]  = 3;
+
     if (!m_certFingerprintSha256Hex.empty()) {
         beacon["cert_fingerprint_sha256"] = m_certFingerprintSha256Hex;
     }
@@ -604,14 +656,38 @@ void DiscoveryService::parseBeacon(const std::string& jsonStr, const std::string
         return;
     }
 
-    // NEW: Check for goodbye beacon type
+    // Optional anti-replay timestamp check.
+    // timestamp_ms is absent in v0.2 beacons -- skip check for backward compat.
+    if (beacon.contains("timestamp_ms")) {
+        const int64_t beaconTime = beacon["timestamp_ms"].get<int64_t>();
+        const int64_t localTime  = static_cast<int64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now().time_since_epoch()).count());
+        const int64_t ageDelta = std::abs(localTime - beaconTime);
+        if (ageDelta > BEACON_TIMESTAMP_MAX_AGE_MS) {
+            std::cerr << "[Discovery] Beacon from " << senderIp
+                      << " rejected: timestamp age " << ageDelta
+                      << " ms (limit " << BEACON_TIMESTAMP_MAX_AGE_MS << " ms)\n";
+            return;
+        }
+    }
+
+    // Goodbye beacon: remove peer only if the goodbye came from the known IP
+    // of that peer. This prevents a spoofed goodbye from removing a live peer.
     if (beacon.contains("beacon_type") && beacon["beacon_type"] == BEACON_TYPE_GOODBYE) {
         std::lock_guard<std::mutex> lock(m_peerMutex);
-
         auto it = m_peers.find(uuid);
         if (it != m_peers.end()) {
-            std::string displayName = beacon["display_name"];
-            m_peers.erase(it);
+            if (it->second.ipAddress == senderIp) {
+                std::cout << "[Discovery] Peer departed (goodbye validated): "
+                          << uuid << " (" << senderIp << ")\n";
+                m_peers.erase(it);
+            } else {
+                std::cerr << "[Discovery] Goodbye from " << senderIp
+                          << " claimed UUID " << uuid
+                          << " (peer known at " << it->second.ipAddress
+                          << ") -- IGNORED (possible spoofing attempt)\n";
+            }
         }
         return;
     }
@@ -658,46 +734,70 @@ void DiscoveryService::parseBeacon(const std::string& jsonStr, const std::string
 //=============================================================================
 
 bool DiscoveryService::initializeSocket() {
-    // Initialize Winsock
+    // Initialize Winsock once for this service instance.
     WSADATA wsaData;
-    int result = WSAStartup(MAKEWORD(2, 2), &wsaData);
-    if (result != 0) {
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "[Discovery] WSAStartup failed\n";
         return false;
     }
 
-    // Create UDP socket
-    SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if (sock == INVALID_SOCKET) {
-        WSACleanup();
-        return false;
-    }
+    for (uint16_t port : DISCOVERY_POOL_PORTS) {
+        SOCKET sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+        if (sock == INVALID_SOCKET) {
+            std::cerr << "[Discovery] socket() failed: " << WSAGetLastError()
+                      << " -- cannot create UDP socket\n";
+            WSACleanup();
+            return false;
+        }
 
-    // Enable SO_BROADCAST
-    int optval = 1;
-    result = setsockopt(sock, SOL_SOCKET, SO_BROADCAST,
-                       reinterpret_cast<char*>(&optval), sizeof(optval));
-    if (result == SOCKET_ERROR) {
+        // Enable SO_BROADCAST for sending broadcast beacons.
+        int broadcastEnable = 1;
+        if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST,
+                       reinterpret_cast<char*>(&broadcastEnable),
+                       sizeof(broadcastEnable)) == SOCKET_ERROR) {
+            closesocket(sock);
+            WSACleanup();
+            std::cerr << "[Discovery] SO_BROADCAST failed: " << WSAGetLastError() << "\n";
+            return false;
+        }
+
+        // Expand UDP receive buffer to absorb bursts from up to 100 simultaneous peers.
+        // Non-fatal if Windows clamps the value -- log actual size and continue.
+        int rcvBuf = UDP_RECV_BUF_SIZE;
+        setsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+                   reinterpret_cast<char*>(&rcvBuf), sizeof(rcvBuf));
+        int actualBuf = 0;
+        int optLen = sizeof(actualBuf);
+        if (getsockopt(sock, SOL_SOCKET, SO_RCVBUF,
+                       reinterpret_cast<char*>(&actualBuf), &optLen) == 0) {
+            std::cout << "[Discovery] UDP recv buffer: requested " << UDP_RECV_BUF_SIZE
+                      << " bytes, actual " << actualBuf << " bytes\n";
+        }
+
+        sockaddr_in localAddr{};
+        localAddr.sin_family      = AF_INET;
+        localAddr.sin_addr.s_addr = INADDR_ANY;
+        localAddr.sin_port        = htons(port);
+
+        if (bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == 0) {
+            m_udpSocket          = sock;
+            m_socketInitialized  = true;
+            m_boundDiscoveryPort = port;
+            std::cout << "[Discovery] Bound UDP discovery socket to port " << port << "\n";
+            return true;
+        }
+
+        const int err = WSAGetLastError();
         closesocket(sock);
-        WSACleanup();
-        return false;
+        std::cout << "[Discovery] Port " << port << " unavailable (WSA " << err
+                  << "), trying next pool port\n";
     }
 
-    // Bind to discovery port
-    sockaddr_in localAddr;
-    localAddr.sin_family = AF_INET;
-    localAddr.sin_addr.s_addr = INADDR_ANY;
-    localAddr.sin_port = htons(DISCOVERY_PORT_DEFAULT);
-
-    result = bind(sock, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr));
-    if (result == SOCKET_ERROR) {
-        closesocket(sock);
-        WSACleanup();
-        return false;
-    }
-
-    m_udpSocket = sock;
-    m_socketInitialized = true;
-    return true;
+    WSACleanup();
+    std::cerr << "[Discovery] All discovery pool ports unavailable. Tried: "
+              << "41000, 42100, 43210, 43500, 45100, 46000, 46100, 47100, 47500, 48100. "
+              << "Cannot start discovery service.\n";
+    return false;
 }
 
 void DiscoveryService::cleanupSocket() {
@@ -713,6 +813,8 @@ void DiscoveryService::cleanupSocket() {
         WSACleanup();
         m_socketInitialized = false;
     }
+
+    m_boundDiscoveryPort = 0;
 }
 
 //=============================================================================
@@ -720,44 +822,80 @@ void DiscoveryService::cleanupSocket() {
 //=============================================================================
 
 void DiscoveryService::broadcastGoodbye() {
-    // Get all broadcast addresses
     std::vector<std::string> broadcastAddresses = getBroadcastAddresses();
 
-    // Create goodbye beacon JSON
     json beacon;
-    beacon["protocol_id"] = PROTOCOL_ID;
-    beacon["beacon_type"] = BEACON_TYPE_GOODBYE;
-    beacon["device_uuid"] = m_uuid;
-    beacon["display_name"] = m_displayName;
+    beacon["protocol_id"]    = PROTOCOL_ID;
+    beacon["beacon_type"]    = BEACON_TYPE_GOODBYE;
+    beacon["device_uuid"]    = m_uuid;
+    beacon["display_name"]   = m_displayName;
+    beacon["discovery_port"] = m_boundDiscoveryPort;
+    beacon["timestamp_ms"]   = static_cast<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    beacon["proto_version"]  = 3;
 
     std::string goodbyeBeacon = beacon.dump();
 
-    // Broadcast goodbye multiple times for reliability
+    // Broadcast goodbye multiple times to all pool ports for reliability.
+    // Receivers validate the sender IP before acting on goodbye beacons.
     for (int i = 0; i < GOODBYE_BROADCAST_COUNT; ++i) {
-        // Send to each broadcast address
-        for (const auto& broadcastIp : broadcastAddresses) {
-            sockaddr_in broadcastAddr;
-            broadcastAddr.sin_family = AF_INET;
-            broadcastAddr.sin_port = htons(DISCOVERY_PORT_DEFAULT);
-            inet_pton(AF_INET, broadcastIp.c_str(), &broadcastAddr.sin_addr);
-
-            sendto(
-                m_udpSocket,
-                goodbyeBeacon.c_str(),
-                static_cast<int>(goodbyeBeacon.length()),
-                0,
-                reinterpret_cast<sockaddr*>(&broadcastAddr),
-                sizeof(broadcastAddr)
-            );
+        for (uint16_t targetPort : DISCOVERY_POOL_PORTS) {
+            for (const auto& broadcastIp : broadcastAddresses) {
+                sockaddr_in broadcastAddr{};
+                broadcastAddr.sin_family = AF_INET;
+                broadcastAddr.sin_port   = htons(targetPort);
+                inet_pton(AF_INET, broadcastIp.c_str(), &broadcastAddr.sin_addr);
+                sendto(m_udpSocket,
+                       goodbyeBeacon.c_str(),
+                       static_cast<int>(goodbyeBeacon.length()),
+                       0,
+                       reinterpret_cast<sockaddr*>(&broadcastAddr),
+                       sizeof(broadcastAddr));
+            }
         }
 
-        // Small delay between broadcasts (except after last one)
         if (i < GOODBYE_BROADCAST_COUNT - 1) {
             std::this_thread::sleep_for(
-                std::chrono::milliseconds(GOODBYE_BROADCAST_DELAY_MS)
-            );
+                std::chrono::milliseconds(GOODBYE_BROADCAST_DELAY_MS));
         }
     }
+}
+
+//=============================================================================
+// Public helpers (including test helpers)
+//=============================================================================
+
+bool DiscoveryService::hasPeerByIp(const std::string& ip) const {
+    std::lock_guard<std::mutex> lock(m_peerMutex);
+    for (const auto& [uuid, peer] : m_peers) {
+        if (peer.ipAddress == ip) return true;
+    }
+    return false;
+}
+
+void DiscoveryService::injectPeerForTesting(const std::string& uuid,
+                                            const std::string& displayName,
+                                            const std::string& ip,
+                                            uint16_t tcpPort) {
+    PeerInfo peer(uuid, displayName, ip, tcpPort, "");
+    std::lock_guard<std::mutex> lock(m_peerMutex);
+    m_peers[uuid] = peer;
+}
+
+bool DiscoveryService::hasPeer(const std::string& uuid) const {
+    std::lock_guard<std::mutex> lock(m_peerMutex);
+    return m_peers.count(uuid) > 0;
+}
+
+void DiscoveryService::simulateIncomingBeacon(const std::string& beaconJson,
+                                              const std::string& senderIp) {
+    // Bypasses the rate limiter so tests can control rate-limit behavior directly.
+    parseBeacon(beaconJson, senderIp);
+}
+
+std::string DiscoveryService::generateBeaconJsonForTesting() const {
+    return generateBeaconJson();
 }
 
 }  // namespace ExoSend

@@ -146,18 +146,23 @@ void IncomingTransferDialog::setupUi()
     m_infoLabel = new QLabel();
     QString sizeStr = formatFileSize(m_fileSize);
 
-    // "Asus (192.168.83.1:9999)" with gray IP color (port omitted if unknown)
+    // "<PeerName> (192.168.83.1:<port>)" with gray IP color (port omitted if unknown)
     QString peerAddress = m_peerIp;
     if (m_peerPort != 0) {
         peerAddress += ":" + QString::number(m_peerPort);
     }
 
+    // Security: peer-controlled fields may contain HTML. Escape before using RichText.
+    const QString safePeerName = m_peerName.toHtmlEscaped();
+    const QString safePeerAddress = peerAddress.toHtmlEscaped();
+    const QString safeFilename = m_filename.toHtmlEscaped();
+
     QString messageHtml = QString("<b>%1</b> <span style='color:#808080;'>(%2)</span> wants to send you a file:<br><br>"
                                   "File: <b>%3</b><br>"
                                   "Size: %4")
-                              .arg(m_peerName)
-                              .arg(peerAddress)
-                              .arg(m_filename)
+                              .arg(safePeerName)
+                              .arg(safePeerAddress)
+                              .arg(safeFilename)
                               .arg(sizeStr);
     m_infoLabel->setText(messageHtml);
     m_infoLabel->setTextFormat(Qt::RichText);
@@ -166,6 +171,7 @@ void IncomingTransferDialog::setupUi()
 
     // UUID display (monospace, gray color)
     QLabel* uuidLabel = new QLabel("UUID: " + m_peerUuid);
+    uuidLabel->setTextFormat(Qt::PlainText);
     uuidLabel->setFont(QFont("Consolas", 8));
     uuidLabel->setStyleSheet("color: #808080;");
     uuidLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);

@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <filesystem>
 #include <mutex>
 #include <string>
 
@@ -42,7 +43,7 @@ public:
      * Must be called before any worker threads are started.
      * Calling log() before initialize() will silently fail.
      */
-    static void initialize(const std::string& logPath);
+    static void initialize(const std::filesystem::path& logPath);
 
     /**
      * @brief Log a std::string message
@@ -77,7 +78,7 @@ private:
     static std::mutex s_mutex;
 
     /// Pre-computed log file path (set by initialize(), never changes after that)
-    static std::string s_logPath;
+    static std::filesystem::path s_logPath;
 };
 
 } // namespace ExoSend

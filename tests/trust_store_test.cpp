@@ -51,3 +51,31 @@ TEST(TrustStoreTest, FromJsonSkipsInvalidEntries) {
     EXPECT_FALSE(parsed.hasPeer("bad2"));
 }
 
+TEST(TrustStoreTest, RevokePeer) {
+    TrustStore store;
+    const std::string fp = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    store.pinPeer("u1", fp, "One", "2026-02-24T00:00:00Z");
+    ASSERT_TRUE(store.hasPeer("u1"));
+
+    EXPECT_TRUE(store.revokePeer("u1"));
+    EXPECT_FALSE(store.hasPeer("u1"));
+
+    // Revoking again or a non-existent peer returns false
+    EXPECT_FALSE(store.revokePeer("u1"));
+    EXPECT_FALSE(store.revokePeer("nonexistent"));
+}
+
+TEST(TrustStoreTest, Clear) {
+    TrustStore store;
+    const std::string fp1 = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    const std::string fp2 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    store.pinPeer("u1", fp1, "One", "2026-02-24T00:00:00Z");
+    store.pinPeer("u2", fp2, "Two", "2026-02-24T00:00:00Z");
+    ASSERT_EQ(store.records().size(), 2u);
+
+    store.clear();
+    EXPECT_TRUE(store.records().empty());
+    EXPECT_FALSE(store.hasPeer("u1"));
+    EXPECT_FALSE(store.hasPeer("u2"));
+}
+

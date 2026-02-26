@@ -48,7 +48,7 @@ int main(int argc, char* argv[])
 
     // Set application metadata
     app.setApplicationName("ExoSend");
-    app.setApplicationVersion("0.2.0");
+    app.setApplicationVersion("0.3.0");
     app.setOrganizationName("ExoSend");
     app.setOrganizationDomain("exosend.local");
 
@@ -86,6 +86,12 @@ int main(int argc, char* argv[])
     // Load settings from file
     if (!settings->loadSettings()) {
         // Settings file doesn't exist or is corrupt - use defaults
+    }
+
+    // Apply crash dump privacy setting unless explicitly overridden by env var.
+    // EXOSEND_ENABLE_CRASH_DUMPS is parsed inside installCrashHandlers() for very-early crashes.
+    if (!qEnvironmentVariableIsSet("EXOSEND_ENABLE_CRASH_DUMPS")) {
+        ExoSend::setCrashDumpsEnabled(settings->getEnableCrashDumps());
     }
 
     // Create main window with settings (MainWindow takes ownership)

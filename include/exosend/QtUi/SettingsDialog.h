@@ -4,6 +4,8 @@
  *
  * This class provides a dialog for editing application settings
  * including device name, download path, and displaying device UUID.
+ * In v0.3.0 a "Trusted Peers" tab was added for viewing and revoking
+ * paired peer trust records.
  *
  * (c) 2026 ExoSend Project
  * Licensed under MIT License
@@ -22,6 +24,10 @@
 #include <QFormLayout>
 #include <QCheckBox>
 #include <QSlider>
+#include <QTabWidget>
+#include <QListWidget>
+#include <QListWidgetItem>
+#include <QMessageBox>
 
 // Forward declarations
 class SettingsManager;
@@ -30,10 +36,9 @@ class SettingsManager;
  * @class SettingsDialog
  * @brief Modal dialog for editing application settings
  *
- * This dialog allows users to configure:
- * - Display name (device name shown to other peers)
- * - Download path (where received files are saved)
- * - View device UUID (read-only, informational)
+ * Provides two tabs:
+ * - General: display name, download path, UUID, preferences
+ * - Trusted Peers: list of pinned peers with revoke / clear-all actions
  *
  * Usage:
  * ```cpp
@@ -96,13 +101,46 @@ private slots:
      */
     void onReject();
 
+    // ========================================================================
+    // Trusted Peers tab slots (v0.3.0)
+    // ========================================================================
+
+    /**
+     * @brief Revoke trust for the selected peer in the Trusted Peers list.
+     *
+     * Shows a confirmation before removing the peer from the trust store.
+     * Refreshes the list on success.
+     */
+    void onRevokePeer();
+
+    /**
+     * @brief Remove all pinned peers from the trust store.
+     *
+     * Shows a confirmation before clearing the entire trust store.
+     * Refreshes the list on success.
+     */
+    void onClearAllPeers();
+
+    /**
+     * @brief Repopulate the Trusted Peers list from the current trust store.
+     */
+    void refreshTrustedPeersList();
+
 private:
     /**
-     * @brief Set up the user interface
-     *
-     * Creates all widgets and layouts for the dialog.
+     * @brief Set up the user interface (tabbed layout)
      */
     void setupUi();
+
+    /**
+     * @brief Build the General settings tab widget
+     */
+    QWidget* buildGeneralTab();
+
+    /**
+     * @brief Build the Trusted Peers management tab widget
+     */
+    QWidget* buildTrustedPeersTab();
 
     /**
      * @brief Load settings from SettingsManager into UI fields
@@ -124,7 +162,9 @@ private:
 private:
     SettingsManager* m_settings;      ///< Settings manager (not owned)
 
-    // UI Widgets
+    // ========================================================================
+    // General tab widgets
+    // ========================================================================
     QLineEdit* m_displayNameEdit;     ///< Device name edit field
     QLineEdit* m_downloadPathEdit;    ///< Download path edit field
     QLabel* m_uuidLabel;              ///< Device UUID display (read-only)
@@ -132,8 +172,16 @@ private:
     QPushButton* m_browseButton;      ///< Browse button for download path
     QDialogButtonBox* m_buttonBox;    ///< Standard dialog buttons
     QCheckBox* m_showCloseWarningCheckBox;  ///< Checkbox for close warning preference
-    QSlider* m_peerTimeoutSlider;     ///< Peer timeout slider (1-10 seconds)
-    QLabel* m_peerTimeoutValueLabel;  ///< Label showing current timeout value
+    QCheckBox* m_enableCrashDumpsCheckBox;  ///< Checkbox for crash dump writing (privacy)
+    QSlider* m_peerTimeoutSlider;     ///< Peer timeout slider (unused, kept for compat)
+    QLabel* m_peerTimeoutValueLabel;  ///< Label showing current timeout value (unused)
+
+    // ========================================================================
+    // Trusted Peers tab widgets (v0.3.0)
+    // ========================================================================
+    QListWidget* m_trustedPeersList{nullptr};     ///< List of pinned peers
+    QPushButton* m_revokePeerButton{nullptr};     ///< Revoke selected peer
+    QPushButton* m_clearAllPeersButton{nullptr};  ///< Clear all pairs
 };
 
 #endif // EXOSEND_QTUI_SETTINGSDIALOG_H

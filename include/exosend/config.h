@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <winsock2.h>
 
@@ -33,39 +34,52 @@ namespace ExoSend {
 //=========================================================================
 
 /** @defgroup NetworkPorts Network Ports Configuration
- * @brief Default UDP and TCP port numbers for ExoSend
+ * @brief UDP discovery port pool and dynamic TCP port for ExoSend
  *
- * These constants define the network ports used for peer discovery and
- * file transfer operations. Ensure these ports are open in any firewall
- * configuration.
+ * UDP discovery uses a port pool: DiscoveryService binds the first available
+ * port and broadcasts beacons to ALL pool ports so peers on different pool
+ * ports still discover each other. TCP transfer binds to port 0 and reads
+ * the OS-assigned ephemeral port via getsockname().
  * @{
  */
 
 /**
- * @brief Default UDP port for peer discovery beacons
+ * @brief UDP discovery port pool (10 ports, IANA registered range 40000-49151).
  *
- * ExoSend broadcasts JSON beacons on this port (8888) every 2 seconds.
- * All peers must listen on this port to discover each other on the local network.
- * Alternate port 9998 is supported for V2 compatibility.
+ * DiscoveryService iterates this list and binds the first available port.
+ * Beacons are broadcast to EVERY port in this pool so peers bound to
+ * different pool ports still discover each other.
+ *
+ * Port selection rationale (researched 2026-02):
+ *   41000: Low conflict -- no known IANA registration or common app default
+ *   42100: Low conflict -- avoids VTun at 42000 (IANA registered)
+ *   43210: Low conflict -- no known registration; memorable but not a documented default
+ *   43500: Low conflict -- clear of 44818 (EtherNet/IP, IANA, common in industrial Win)
+ *   45100: Low conflict -- avoids 44818 and 45000 (ASMP)
+ *   46000: Low conflict -- no known IANA registration
+ *   46100: Low conflict -- no known registration
+ *   47100: Low conflict -- avoids 47001 (WinRM, Windows Remote Management)
+ *   47500: Low conflict -- no known registration
+ *   48100: Low conflict -- avoids 48000 (Nimbus, IANA registered)
+ *
+ * CAUTION: Port 38888 (original choice) is FineReport's WebSocket port -- AVOIDED.
+ * CAUTION: Port 38889 is FineReport NGINX proxy port -- AVOIDED.
+ * All pool ports are in IANA registered range (1024-49151) to avoid Windows
+ * ephemeral ports (49152-65535) which the OS uses for outbound connections.
  */
-constexpr uint16_t DISCOVERY_PORT_DEFAULT = 8888;
+constexpr std::array<uint16_t, 10> DISCOVERY_POOL_PORTS = {
+    41000, 42100, 43210, 43500, 45100,
+    46000, 46100, 47100, 47500, 48100
+};
 
 /**
- * @brief Default TCP port for file transfer connections
+ * @brief TCP transfer port: documentation only.
  *
- * ExoSend listens for incoming transfer connections on this port.
- * Clients connect to this port to initiate file transfers.
- * Ensure this port is not blocked by firewall software.
+ * TransferServer binds to port 0 so the OS assigns a free ephemeral port
+ * (49152-65535) and reads it via getsockname(). This constant exists for
+ * backward-compatible code that previously referenced TCP_PORT_DEFAULT.
  */
-constexpr uint16_t TCP_PORT_DEFAULT = 9999;
-
-/**
- * @brief Alternate discovery port for V2 compatibility
- *
- * This port is supported to maintain compatibility with older versions
- * of ExoSend that may use port 9998 for discovery.
- */
-constexpr uint16_t DISCOVERY_PORT_ALTERNATE = 9998;
+constexpr uint16_t TCP_PORT_DEFAULT = 0;
 
 /** @} */ // end of NetworkPorts
 
@@ -82,13 +96,31 @@ constexpr uint16_t DISCOVERY_PORT_ALTERNATE = 9998;
  */
 
 /**
- * @brief Interval between discovery beacon broadcasts
+ * @brief Steady-state interval between discovery beacon broadcasts.
  *
- * ExoSend broadcasts a JSON beacon every 2000ms (2 seconds) to announce
- * its presence on the network. Lower values increase discovery speed but
- * generate more network traffic.
+ * 5 seconds keeps WiFi broadcast load below 3.2% of 6 Mbps basic rate at
+ * 100 nodes (10 pool ports x 100 nodes x 1 pkt/5s = 200 pkts/s = ~0.3 Mbps).
+ * ExoSend sends an initial burst of DISCOVERY_STARTUP_BURST_COUNT beacons at
+ * DISCOVERY_STARTUP_INTERVAL_MS for fast initial peer discovery, then switches
+ * to this steady-state interval.
  */
-constexpr uint32_t DISCOVERY_INTERVAL_MS = 2000;
+constexpr uint32_t DISCOVERY_INTERVAL_MS = 5000;
+
+/**
+ * @brief Fast startup beacon interval.
+ *
+ * Used for the first DISCOVERY_STARTUP_BURST_COUNT beacons only.
+ * Allows peers to appear quickly after launching ExoSend without
+ * waiting the full steady-state interval.
+ */
+constexpr uint32_t DISCOVERY_STARTUP_INTERVAL_MS = 2000;
+
+/**
+ * @brief Number of beacons to send at DISCOVERY_STARTUP_INTERVAL_MS.
+ *
+ * After this many beacons, the transmitter switches to DISCOVERY_INTERVAL_MS.
+ */
+constexpr int DISCOVERY_STARTUP_BURST_COUNT = 5;
 
 /**
  * @brief Peer inactivity timeout
@@ -132,6 +164,96 @@ constexpr const char* BEACON_TYPE_GOODBYE = "goodbye";    ///< Departure notific
 constexpr uint32_t GC_INTERVAL_MS = 5000;
 
 /** @} */ // end of Timing
+
+//=========================================================================
+// Security and Rate Limiting
+//=========================================================================
+
+/** @defgroup SecurityConfig Security and Rate Limiting Configuration
+ * @brief Constants for beacon flood protection, anti-replay, and jitter.
+ * @{
+ */
+
+/**
+ * @brief Maximum beacon packets processed per source IP within the sliding window.
+ *
+ * Excess packets are dropped BEFORE JSON parse to prevent CPU amplification
+ * from flood attacks. 10 beacons / 5 seconds is well above normal peer activity.
+ */
+constexpr size_t BEACON_RATE_LIMIT_MAX_COUNT = 10;
+
+/**
+ * @brief Sliding window duration for per-IP beacon rate limiting (ms).
+ */
+constexpr int64_t BEACON_RATE_LIMIT_WINDOW_MS = 5000;
+
+/**
+ * @brief Maximum number of distinct source IPs tracked by the beacon rate limiter.
+ *
+ * UDP source IPs can be spoofed. Bounding the in-memory tracking table prevents
+ * unbounded growth under a spoofed-source flood.
+ */
+constexpr size_t BEACON_RATE_LIMIT_MAX_IPS = 2048;
+
+/**
+ * @brief Maximum TCP connection attempts processed per source IP within the sliding window.
+ *
+ * This bounds thread and TLS-handshake churn under connection floods.
+ */
+constexpr size_t TRANSFER_CONN_RATE_LIMIT_MAX_COUNT = 20;
+
+/**
+ * @brief Sliding window duration for per-IP TCP connection rate limiting (ms).
+ */
+constexpr int64_t TRANSFER_CONN_RATE_LIMIT_WINDOW_MS = 10000;
+
+/**
+ * @brief Maximum number of distinct source IPs tracked by the TCP connection rate limiter.
+ */
+constexpr size_t TRANSFER_CONN_RATE_LIMIT_MAX_IPS = 2048;
+
+/**
+ * @brief Maximum age of a beacon's timestamp_ms field before rejection.
+ *
+ * Beacons whose timestamp_ms differs from the local wall clock by more than
+ * this value are rejected as likely replays or stale packets.
+ * 60 seconds covers worst-case NTP skew on offline machines
+ * (Kerberos uses 5 minutes; we use 60s for stricter protection).
+ *
+ * IMPORTANT: timestamp_ms is optional for backward compatibility with v0.2
+ * peers. If the field is absent, the timestamp check is skipped entirely.
+ */
+constexpr int64_t BEACON_TIMESTAMP_MAX_AGE_MS = 300000; // 300 s (5 min) -- tolerates VMware clock drift on paused/resumed VMs
+
+/**
+ * @brief Maximum jitter applied to beacon interval as a percentage.
+ *
+ * Each beacon cycle adds a random offset of up to +/- this percentage of
+ * the current interval. At 20% with DISCOVERY_INTERVAL_MS=5000ms: actual
+ * interval is 4000-6000ms. This desynchronises 100 peers to prevent
+ * simultaneous broadcast storms (thundering herd).
+ */
+constexpr int BEACON_JITTER_MAX_PERCENT = 20;
+
+/**
+ * @brief UDP socket receive buffer size (bytes).
+ *
+ * 512 KB absorbs bursts from up to 100 peers broadcasting simultaneously.
+ * Windows may silently clamp this value; always verify with getsockopt()
+ * and log the actual buffer size. Non-fatal if the request is partially honored.
+ */
+constexpr int UDP_RECV_BUF_SIZE = 524288;  // 512 KB
+
+/**
+ * @brief Broadcast adapter list refresh interval (seconds).
+ *
+ * The list of network adapter broadcast addresses is refreshed at this interval
+ * to pick up new adapters (VPN connect, WiFi roam, NIC plug) without requiring
+ * a service restart.
+ */
+constexpr int BROADCAST_REFRESH_INTERVAL_S = 60;
+
+/** @} */ // end of SecurityConfig
 
 //=========================================================================
 // Buffer Sizes
@@ -362,6 +484,15 @@ constexpr int MAX_SEND_RETRIES = 5;                 // Max retries for partial s
 constexpr size_t MAX_CONCURRENT_TRANSFERS = 3;
 
 /**
+ * @brief Maximum concurrent incoming client handler threads
+ *
+ * TransferServer spawns a dedicated handler thread per accepted TCP connection.
+ * This limit bounds resource usage under connection floods (including TLS
+ * handshake floods and pairing requests).
+ */
+constexpr size_t MAX_CONCURRENT_INCOMING_CLIENT_THREADS = 16;
+
+/**
  * @brief Transfer queue timeout
  *
  * Queued transfer requests expire after 30000ms (30 seconds)
@@ -413,7 +544,7 @@ constexpr size_t MAX_SESSION_ID_LENGTH = 64;
  * @brief Transport Layer Security settings for secure transfers
  *
  * These constants configure TLS encryption for file transfers.
- * TLS 1.2+ is used to secure data in transit.
+ * TLS 1.3 is used to secure data in transit.
  * @{
  */
 
@@ -428,10 +559,11 @@ constexpr bool TLS_ENABLED = true;                      // Enable/disable TLS
 /**
  * @brief Minimum TLS version
  *
- * The minimum accepted TLS version is "TLSv1.2".
- * Connections using older protocols (SSLv3, TLSv1.0, TLSv1.1) are rejected.
+ * The minimum accepted TLS version is "TLSv1.3".
+ * TLS 1.2 and below are intentionally rejected for maximum security and simpler
+ * protocol surface.
  */
-constexpr const char* TLS_VERSION = "TLSv1.2";          // Minimum TLS version
+constexpr const char* TLS_VERSION = "TLSv1.3";          // Minimum TLS version (docs)
 
 /**
  * @brief TLS cipher suite specification
@@ -439,13 +571,35 @@ constexpr const char* TLS_VERSION = "TLSv1.2";          // Minimum TLS version
  * Specifies which cipher suites are acceptable for TLS connections.
  * This configuration uses strong ciphers and excludes weak ones.
  */
-constexpr const char* TLS_CIPHER_SUITE = "HIGH:!aNULL:!MD5:!3DES";  // Strong cipher suite
+// Added !RC4 (RC4 stream cipher is cryptographically broken since 2013) and
+// !EXPORT (export-grade ciphers are banned; FREAK/LOGJAM attacks exploit them).
+constexpr const char* TLS_CIPHER_SUITE = "HIGH:!aNULL:!MD5:!3DES:!RC4:!EXPORT";
+
+/**
+ * @brief TLS 1.3 cipher suite specification
+ *
+ * TLS 1.3 cipher suites are configured separately from the legacy TLS <= 1.2
+ * cipher list. ExoSend restricts to the strong, widely-supported TLS 1.3
+ * suites provided by OpenSSL.
+ */
+constexpr const char* TLS13_CIPHER_SUITES =
+    "TLS_AES_256_GCM_SHA384:"
+    "TLS_CHACHA20_POLY1305_SHA256:"
+    "TLS_AES_128_GCM_SHA256";
+
+/**
+ * @brief Supported key exchange groups (ECDHE)
+ *
+ * Keep the group list small and modern for predictable security properties.
+ * X25519 is preferred when available.
+ */
+constexpr const char* TLS_GROUPS_LIST = "X25519:P-256:P-384";
 
 /**
  * @brief Certificate directory name
  *
  * TLS certificates are stored in the "certs" subdirectory of
- * %APPDATA%\ExoSend\.
+ * %LOCALAPPDATA%\ExoSend\.
  */
 constexpr const char* CERT_DIR = "certs";
 

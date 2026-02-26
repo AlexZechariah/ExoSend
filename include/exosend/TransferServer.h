@@ -6,10 +6,12 @@
 #pragma once
 
 #include "config.h"
+#include "ConnectionRateLimiter.h"
 #include "TransferSession.h"
 #include "PeerInfo.h"
 #include <string>
 #include <unordered_map>
+#include <unordered_set>
 #include <memory>
 #include <thread>
 #include <atomic>
@@ -20,6 +22,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <cstdint>
+#include <functional>
+#include <array>
 
 namespace ExoSend {
 
@@ -67,6 +71,27 @@ using IncomingConnectionCallback = std::function<bool(const std::string& clientI
                                                         const std::string& pendingSessionId,
                                                         const std::string& peerFingerprintSha256Hex)>;
 
+/**
+ * @brief Incoming pairing callback function type
+ *
+ * Called when a peer initiates a PAIR_REQ over TLS. The callback is expected
+ * to perform any UI prompting required, and if accepted, compute a PAIR_RESP tag
+ * bound to the same TLS channel binding and identity fields.
+ *
+ * @return true to accept pairing and send PAIR_RESP, false to reject (server will send REJECT).
+ */
+using IncomingPairingCallback = std::function<bool(
+    const std::string& clientIp,
+    const std::string& clientUuid,
+    const std::string& clientFingerprintSha256Hex,
+    const std::string& serverUuid,
+    const std::string& serverFingerprintSha256Hex,
+    const std::array<uint8_t, 32>& tlsExporterChannelBinding,
+    const std::array<uint8_t, 32>& clientTag,
+    std::array<uint8_t, 32>& outServerTag,
+    std::string& errorMsg
+)>;
+
 //=============================================================================
 // TransferServer Class
 //=============================================================================
@@ -92,13 +117,15 @@ using IncomingConnectionCallback = std::function<bool(const std::string& clientI
  *
  * Usage:
  * @code
- * TransferServer server(9999);
+ * // Use port 0 to let the OS assign an ephemeral port (recommended).
+ * TransferServer server;
  * server.setSessionEventCallback([](const std::string& id, SessionStatus status) {
  *     std::cout << "Session " << id << " status: " << (int)status << "\n";
  * });
  *
  * if (server.start()) {
- *     // Server is running, accepting connections
+ *     // Server is running, accepting connections.
+ *     // server.getTcpPort() returns the actual bound port (non-zero).
  *     // ...
  *     server.stop();
  * }
@@ -108,9 +135,11 @@ class TransferServer {
 public:
     /**
      * @brief Constructor
-     * @param port TCP port to listen on (default: 9999)
+     * @param port TCP port to listen on (default: TCP_PORT_DEFAULT, typically 0)
      *
      * Creates a TransferServer that will listen on the specified port.
+     * If port is 0, the OS assigns an ephemeral port, which can be queried via
+     * getTcpPort() after start() succeeds.
      * The server is not started until start() is called.
      */
     explicit TransferServer(uint16_t port = TCP_PORT_DEFAULT);
@@ -172,6 +201,13 @@ public:
     size_t getActiveSessionCount() const { return m_activeSessionCount.load(); }
 
     /**
+     * @brief Get current number of active client handler threads.
+     *
+     * This includes pairing-only connections (PAIR_REQ) and file transfers.
+     */
+    size_t getActiveClientThreadCount() const { return m_activeClientThreadCount.load(); }
+
+    /**
      * @brief Get a list of active session IDs
      * @return Vector of session IDs
      *
@@ -215,6 +251,13 @@ public:
     void setMaxIncomingSizeBytes(uint64_t bytes) { m_maxIncomingSizeBytes = bytes; }
 
     /**
+     * @brief Set local device UUID used for pairing tags (PAIR_REQ/PAIR_RESP).
+     *
+     * This must be set by the GUI layer from persisted settings.
+     */
+    void setLocalDeviceUuid(const std::string& uuid) { m_localDeviceUuid = uuid; }
+
+    /**
      * @brief Get the download directory
      * @return Current download directory
      */
@@ -242,8 +285,38 @@ public:
     }
 
     /**
+     * @brief Set callback invoked when a PAIR_REQ is received.
+     */
+    void setIncomingPairingCallback(IncomingPairingCallback callback) {
+        m_incomingPairingCallback = callback;
+    }
+
+    /// Type for the IP pre-filter callback.
+    using IpValidatorCallback = std::function<bool(const std::string& clientIp)>;
+
+    /// Set a callback invoked for each incoming TCP connection BEFORE the TLS handshake.
+    /// If it returns false the connection is immediately closed.
+    /// If no callback is set (default), all connections are accepted
+    /// (TLS + ExoSend protocol still authenticate them).
+    ///
+    /// Wire from MainWindow:
+    ///   server.setIpValidatorCallback(
+    ///       [this](const std::string& ip) { return m_discovery->hasPeerByIp(ip); });
+    void setIpValidatorCallback(IpValidatorCallback cb) {
+        m_ipValidator = std::move(cb);
+    }
+
+    /// Returns the TCP port the server is currently listening on.
+    /// Returns 0 before start() or after stop().
+    uint16_t getTcpPort() const { return m_boundTcpPort; }
+
+    /**
      * @brief Get the listening port
      * @return TCP port number
+     *
+     * This returns the configured/requested port. If it is 0, the server is
+     * configured for OS-assigned ephemeral port selection. Use getTcpPort() for
+     * the actual bound port after start() succeeds.
      */
     uint16_t getPort() const { return m_port; }
 
@@ -336,6 +409,13 @@ private:
     std::unordered_map<std::string, std::unique_ptr<TransferSession>> m_sessions;
     std::atomic<size_t> m_activeSessionCount;   ///< Fast access to count
 
+    // Active client handler threads (including pairing requests)
+    std::atomic<size_t> m_activeClientThreadCount{0};
+    mutable std::mutex m_activeClientsMutex;
+    std::unordered_set<SOCKET> m_activeClientSockets;
+    std::condition_variable m_activeClientsCv;
+    std::mutex m_activeClientsCvMutex;
+
     // Session reference tracking to prevent premature cleanup
     // Note: Prevents cleanup thread from removing sessions that have pending callbacks
     mutable std::mutex m_sessionRefCountMutex;
@@ -350,6 +430,15 @@ private:
     // Callbacks
     SessionEventCallback m_sessionEventCallback;
     IncomingConnectionCallback m_incomingConnectionCallback;
+    IncomingPairingCallback m_incomingPairingCallback;
+    IpValidatorCallback  m_ipValidator;          ///< Optional pre-TLS IP filter (nullptr = accept all)
+    ConnectionRateLimiter m_connectionRateLimiter;
+
+    // Pairing identity (provided by GUI settings)
+    std::string m_localDeviceUuid;
+
+    // Dynamic TCP port (assigned by OS via getsockname() after bind(0))
+    uint16_t             m_boundTcpPort{0};      ///< Actual bound port; 0 before start() or after stop()
 
     // Pending transfer info (thread-safe)
     // Stores filename for each session before TransferSession is created

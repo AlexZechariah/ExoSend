@@ -21,9 +21,9 @@ namespace ExoSend {
 
 // Static member definitions
 std::mutex ThreadSafeLog::s_mutex;
-std::string ThreadSafeLog::s_logPath;
+std::filesystem::path ThreadSafeLog::s_logPath;
 
-void ThreadSafeLog::initialize(const std::string& logPath) {
+void ThreadSafeLog::initialize(const std::filesystem::path& logPath) {
     // Called from Qt main thread before any worker threads start.
     // No lock needed here since no other threads are running yet.
     s_logPath = logPath;
@@ -58,7 +58,8 @@ void ThreadSafeLog::log(const std::string& message) {
         << '.' << std::setfill('0') << std::setw(3) << ms.count()
         << " - " << message << "\n";
 
-    // Use std::ofstream (no Qt) - safe from any thread
+    // Use std::ofstream (no Qt) - safe from any thread.
+    // Use std::filesystem::path to support Unicode paths on Windows.
     std::ofstream file(s_logPath, std::ios::app);
     if (file.is_open()) {
         file << oss.str();

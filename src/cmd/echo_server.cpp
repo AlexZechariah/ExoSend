@@ -2,7 +2,8 @@
  * @file echo_server.cpp
  * @brief Simple TCP echo server for testing
  *
- * This server listens on localhost:9999 and prints any received messages.
+ * This server binds to an OS-assigned port (or a port supplied on the command line)
+ * and prints any received messages.
  */
 
 #include <winsock2.h>
@@ -13,8 +14,9 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-// Constants from config
-constexpr uint16_t SERVER_PORT = 9999;
+// Default port: 0 means OS assigns an ephemeral port.
+// Specify a port on the command line: echo_server.exe 0.0.0.0 <port>
+constexpr uint16_t SERVER_PORT = 0;
 constexpr size_t BUFFER_SIZE = 4096;
 constexpr int BACKLOG = SOMAXCONN;
 
@@ -67,7 +69,12 @@ int main(int argc, char* argv[]) {
     // Setup the server address structure
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = inet_addr(bindIp);
+    if (InetPtonA(AF_INET, bindIp, &serverAddr.sin_addr) != 1) {
+        std::cerr << "ERROR: Invalid bind IP address: " << bindIp << "\n";
+        closesocket(listenSocket);
+        WSACleanup();
+        return 1;
+    }
     serverAddr.sin_port = htons(bindPort);
 
     // Bind the socket

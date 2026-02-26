@@ -34,7 +34,11 @@ enum class PacketType : uint8_t {
     // v0.2.0+ protocol extensions (no v0.1.0 compatibility by design)
     HASH = 0x05,    ///< Sender sends final SHA-256 for verification
     HASH_OK = 0x06, ///< Receiver confirms hash matched
-    HASH_BAD = 0x07 ///< Receiver reports hash mismatch
+    HASH_BAD = 0x07, ///< Receiver reports hash mismatch
+
+    // v0.3.x+ pairing protocol extensions (maximum-security hardening)
+    PAIR_REQ = 0x08,  ///< Initiate secure pairing (client -> server)
+    PAIR_RESP = 0x09  ///< Pairing confirmation response (server -> client)
 };
 
 /**
@@ -182,7 +186,7 @@ struct ExoHeader {
      *
      * Checks:
      * - Magic number matches 0x45584F53
-     * - Packet type is valid (0x01-0x07)
+     * - Packet type is valid (0x01-0x09)
      * - Filename length is <= 256
      */
     bool isValid() const {
@@ -191,7 +195,7 @@ struct ExoHeader {
         }
 
         if (packetType < static_cast<uint8_t>(PacketType::OFFER) ||
-            packetType > static_cast<uint8_t>(PacketType::HASH_BAD)) {
+            packetType > static_cast<uint8_t>(PacketType::PAIR_RESP)) {
             return false;
         }
 
@@ -230,6 +234,10 @@ struct ExoHeader {
                 return "HASH_OK";
             case PacketType::HASH_BAD:
                 return "HASH_BAD";
+            case PacketType::PAIR_REQ:
+                return "PAIR_REQ";
+            case PacketType::PAIR_RESP:
+                return "PAIR_RESP";
             default:
                 return "UNKNOWN";
         }

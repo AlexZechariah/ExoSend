@@ -4,7 +4,10 @@
  */
 
 #include "exosend/CrashHandler.h"
+#include "exosend/CrashDumpPaths.h"
 #include "exosend/ThreadSafeLog.h"
+#include "exosend/WinSafeFile.h"
+#include "exosend/WindowsAcl.h"
 #include <QCoreApplication>
 #include <QDateTime>
 #include <QDir>
@@ -16,6 +19,8 @@
 #include <signal.h>
 #include <exception>
 #include <cstdlib>
+#include <filesystem>
+#include <string>
 
 namespace ExoSend {
 
@@ -24,19 +29,82 @@ namespace ExoSend {
 static EXCEPTION_POINTERS g_exceptionPointers = {nullptr, nullptr};
 static bool g_hasExceptionInfo = false;
 static DWORD g_exceptionCode = 0;  // Store exception code separately for logging
+static bool g_crashDumpsEnabled = true;
 
 namespace {
     // Thread-safe logging macro - uses ThreadSafeLog for all crash logging
     #define LogTransferCrash(msg) ExoSend::ThreadSafeLog::log(msg)
 
-    QString getExecutableDirectory() {
-        // Use Windows API first; fall back to Qt if needed.
-        WCHAR exePath[MAX_PATH];
-        DWORD result = GetModuleFileNameW(NULL, exePath, MAX_PATH);
-        if (result == 0 || result >= MAX_PATH) {
-            return QCoreApplication::applicationDirPath();
+    bool parseBoolEnvVar(const char* key, bool& outValue) {
+        outValue = true;
+        char buf[64] = {0};
+        const DWORD n = GetEnvironmentVariableA(key, buf, static_cast<DWORD>(sizeof(buf)));
+        if (n == 0 || n >= sizeof(buf)) {
+            return false;
         }
-        return QFileInfo(QString::fromWCharArray(exePath)).absolutePath();
+
+        std::string v(buf);
+        for (char& c : v) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+
+        if (v == "1" || v == "true" || v == "yes" || v == "on") {
+            outValue = true;
+            return true;
+        }
+        if (v == "0" || v == "false" || v == "no" || v == "off") {
+            outValue = false;
+            return true;
+        }
+        return false;
+    }
+
+    bool ensureCrashDumpDirectory(std::wstring& outFinalDir, std::string& errorMsg) {
+        errorMsg.clear();
+        outFinalDir.clear();
+
+        const auto dir = ExoSend::CrashDumpPaths::dumpDir();
+        if (dir.empty()) {
+            errorMsg = "Crash dump dir resolution failed";
+            return false;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(dir, ec);
+        if (ec) {
+            errorMsg = "Failed to create crash dump directory";
+            return false;
+        }
+
+        // Restrict directory ACL (defense-in-depth).
+        std::wstring aclErr;
+        (void)ExoSend::restrictPathToCurrentUser(dir.wstring(), &aclErr);
+
+        // Resolve final dir path via handle.
+        return ExoSend::getFinalPathForDirectory(dir.wstring(), outFinalDir, errorMsg);
+    }
+
+    bool writeCrashTextLog(const std::filesystem::path& logPath,
+                           const QString& reason,
+                           std::string& errorMsg) {
+        errorMsg.clear();
+
+        void* handle = nullptr;
+        std::wstring finalPath;
+        if (!ExoSend::createNewWinFileExclusive(logPath.wstring(), handle, finalPath, errorMsg)) {
+            return false;
+        }
+        ExoSend::ScopedWinFile file(handle);
+
+        const std::string content =
+            "=== CRASH DETECTED ===\r\n"
+            "Timestamp: " + QDateTime::currentDateTime().toString().toStdString() + "\r\n" +
+            "Reason: " + reason.toStdString() + "\r\n" +
+            "Process ID: " + std::to_string(static_cast<unsigned long long>(GetCurrentProcessId())) + "\r\n" +
+            "Thread ID: " + std::to_string(static_cast<unsigned long long>(GetCurrentThreadId())) + "\r\n";
+
+        return ExoSend::writeAllWinFile(file.handle,
+                                       reinterpret_cast<const uint8_t*>(content.data()),
+                                       content.size(),
+                                       errorMsg);
     }
 } // anonymous namespace
 
@@ -48,71 +116,40 @@ namespace {
  * @brief Internal function to write minidump file
  */
 void writeCrashDump(const QString& reason) {
-    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz");
-
-    // Primary dump location: same directory as ExoSend.exe.
-    QString dumpPath = getExecutableDirectory();
-
-    // Ensure target directory exists (normally already exists).
-    QDir dir(dumpPath);
-    if (!dir.exists()) {
-        if (!dir.mkpath(".")) {
-            LogTransferCrash("ERROR: Failed to access executable directory for dumps: " + dumpPath.toStdString());
-
-            // Hard-failure fallback only.
-            dumpPath = QDir::tempPath() + "/ExoSend_crash_dumps/";
-            QDir fallbackDir(dumpPath);
-            fallbackDir.mkpath(".");
-            dir = fallbackDir;
-        }
-    }
-
-    QString dumpFile = dir.absoluteFilePath(QString("crash_%1.dmp").arg(timestamp));
-    QString logFile = dir.absoluteFilePath("crash_log.txt");
-
-    // Log the crash reason immediately (before attempting dump)
-    QFile crashLog(logFile);
-    bool logOpened = crashLog.open(QIODevice::Append | QIODevice::Text);
-    if (logOpened) {
-        QTextStream stream(&crashLog);
-        stream << "=== CRASH DETECTED ===\n";
-        stream << "Timestamp: " << QDateTime::currentDateTime().toString() << "\n";
-        stream << "Reason: " << reason << "\n";
-        stream << "Process ID: " << GetCurrentProcessId() << "\n";
-        stream << "Thread ID: " << GetCurrentThreadId() << "\n";
-        stream.flush();
-    }
-
-    // Create minidump file with error handling
-    HANDLE hFile = CreateFileA(
-        dumpFile.toStdString().c_str(),
-        GENERIC_WRITE,
-        0,
-        NULL,
-        CREATE_ALWAYS,
-        FILE_ATTRIBUTE_NORMAL,
-        NULL
-    );
-
-    if (hFile == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        if (logOpened) {
-            QTextStream stream(&crashLog);
-            stream << "ERROR: CreateFile failed for .dmp - GLE: " << error << "\n";
-            stream << "Attempted path: " << dumpFile << "\n";
-            stream << "=======================\n\n";
-            stream.flush();
-        }
-
-        // Note: Use MessageBox as fallback when logging fails
-        // This ensures users are notified even when crash dump file creation fails
-        QString msg = QString("Failed to create crash dump file:\n%1\nError: %2")
-            .arg(dumpFile)
-            .arg(error);
-        MessageBoxA(NULL, msg.toStdString().c_str(), "Crash Dump Failed", MB_OK | MB_ICONERROR);
-
+    if (!g_crashDumpsEnabled) {
         return;
     }
+
+    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz");
+
+    std::wstring finalDir;
+    std::string dirErr;
+    if (!ensureCrashDumpDirectory(finalDir, dirErr)) {
+        LogTransferCrash("ERROR: Failed to prepare crash dump directory: " + dirErr);
+        return;
+    }
+
+    const unsigned long pid = GetCurrentProcessId();
+    const auto dumpPath = ExoSend::CrashDumpPaths::dumpFilePath(timestamp.toStdString(), pid);
+    const auto logPath = ExoSend::CrashDumpPaths::logFilePath(timestamp.toStdString(), pid);
+
+    // Write crash log first (best-effort).
+    {
+        std::string logErr;
+        if (!writeCrashTextLog(logPath, reason, logErr)) {
+            LogTransferCrash("ERROR: Failed to write crash log: " + logErr);
+        }
+    }
+
+    // Create minidump file securely using CREATE_NEW semantics.
+    void* dumpHandle = nullptr;
+    std::wstring dumpFinalPath;
+    std::string dumpErr;
+    if (!ExoSend::createNewWinFileExclusive(dumpPath.wstring(), dumpHandle, dumpFinalPath, dumpErr)) {
+        LogTransferCrash("ERROR: Failed to create crash dump file: " + dumpErr);
+        return;
+    }
+    ExoSend::ScopedWinFile dumpFileHandle(dumpHandle);
 
     // Enhanced dump type with more information for better analysis
     // NOTE: MiniDumpWithFullMemory is disabled for normal dumps to keep size reasonable
@@ -138,30 +175,19 @@ void writeCrashDump(const QString& reason) {
     BOOL success = MiniDumpWriteDump(
         GetCurrentProcess(),
         GetCurrentProcessId(),
-        hFile,
+        reinterpret_cast<HANDLE>(dumpFileHandle.handle),
         dumpType,
         pExceptionInfo,
         NULL,
         NULL
     );
 
-    DWORD lastError = success ? 0 : GetLastError();
-    CloseHandle(hFile);
-
-    // Log result
-    if (logOpened) {
-        QTextStream stream(&crashLog);
-        if (success) {
-            stream << "SUCCESS: Dump written to " << dumpFile << "\n";
-            stream << "Dump size: " << QFileInfo(dumpFile).size() << " bytes\n";
-            stream.flush();
-        } else {
-            stream << "ERROR: MiniDumpWriteDump failed - GLE: " << lastError << "\n";
-            stream << "ExceptionCode: 0x" << QString::number(g_exceptionCode, 16) << "\n";
-        }
-        stream << "=======================\n\n";
-        stream.flush();
-        crashLog.close();
+    if (!success) {
+        const DWORD lastError = GetLastError();
+        LogTransferCrash("ERROR: MiniDumpWriteDump failed - GLE: " + std::to_string(lastError));
+        LogTransferCrash("ERROR: ExceptionCode: 0x" + std::to_string(static_cast<unsigned long long>(g_exceptionCode)));
+    } else {
+        LogTransferCrash("SUCCESS: Dump written.");
     }
 }
 
@@ -367,37 +393,23 @@ void SignalHandler(int signal) {
  * @brief Verify handler installation and write marker file
  */
 void verifyHandlerInstallation() {
-    // Crash artifacts should be written alongside ExoSend.exe.
-    QString dumpPath = getExecutableDirectory();
-    QDir dir(dumpPath);
-    dir.mkpath(".");
-
-    QDir dumpDir(dumpPath);
-    QString markerFile = dumpDir.absoluteFilePath("handler_installed.txt");
-    QFile marker(markerFile);
-
-    if (marker.open(QIODevice::WriteOnly | QIODevice::Text)) {
-        QTextStream stream(&marker);
-        stream << "Crash Handler Installation Report\n";
-        stream << "==================================\n";
-        stream << "Timestamp: " << QDateTime::currentDateTime().toString() << "\n";
-        stream << "Process ID: " << GetCurrentProcessId() << "\n";
-        stream << "Executable: " << QCoreApplication::applicationFilePath() << "\n";
-        stream << "\nHandlers Installed:\n";
-        stream << "  [x] Vectored Exception Handler\n";
-        stream << "  [x] Unhandled Exception Filter\n";
-        stream << "  [x] C++ Terminate Handler\n";
-        stream << "  [x] Pure Call Handler\n";
-        stream << "  [x] Invalid Parameter Handler\n";
-        stream << "  [x] Signal Handlers (SIGABRT, SIGFPE, SIGILL, SIGSEGV)\n";
-        stream << "  [x] Qt Message Handler\n";
-        stream << "\nDirectory Status:\n";
-        stream << "  Path: " << dumpPath << "\n";
-        stream << "  Writable: " << (QFileInfo(dumpPath).isWritable() ? "YES" : "NO") << "\n";
-        stream << "\nTest Info:\n";
-        stream << "To test handler intentionally, add *((int*)nullptr) = 0; to code\n";
-        marker.close();
+    bool markerEnabled = false;
+    if (!parseBoolEnvVar("EXOSEND_CRASH_HANDLER_MARKER", markerEnabled) || !markerEnabled) {
+        return;
     }
+
+    std::wstring finalDir;
+    std::string dirErr;
+    if (!ensureCrashDumpDirectory(finalDir, dirErr)) {
+        return;
+    }
+
+    const unsigned long pid = GetCurrentProcessId();
+    const QString ts = QDateTime::currentDateTime().toString("yyyyMMdd_hhmmss_zzz");
+    const auto markerPath = ExoSend::CrashDumpPaths::logFilePath(ts.toStdString(), pid);
+
+    std::string err;
+    (void)writeCrashTextLog(markerPath, "Crash Handler Installation Report (marker)", err);
 }
 
 //=============================================================================
@@ -410,6 +422,12 @@ void verifyHandlerInstallation() {
  * This should be called at the very start of main() before any Qt initialization.
  */
 void installCrashHandlers() {
+    // Allow environment override very early for privacy (before settings load).
+    bool envValue = true;
+    if (parseBoolEnvVar("EXOSEND_ENABLE_CRASH_DUMPS", envValue)) {
+        g_crashDumpsEnabled = envValue;
+    }
+
     // Install Qt message handler (catches qCritical, qFatal)
     qInstallMessageHandler(QtMessageHandler);
 
@@ -446,3 +464,13 @@ void installCrashHandlers() {
 }
 
 } // namespace ExoSend
+
+void ExoSend::setCrashDumpsEnabled(bool enabled)
+{
+    g_crashDumpsEnabled = enabled;
+}
+
+bool ExoSend::crashDumpsEnabled()
+{
+    return g_crashDumpsEnabled;
+}

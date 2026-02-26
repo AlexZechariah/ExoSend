@@ -23,13 +23,14 @@ namespace ExoSend {
  * @brief Manages self-signed certificate generation and loading for ExoSend
  *
  * Uses self-signed certificates for TLS encryption. Certificates are stored
- * in %APPDATA%\ExoSend\certs\
+ * in %LOCALAPPDATA%\ExoSend\certs\
  *
  * Security Model:
  * - Self-signed certificates (no CA validation)
  * - Provides encryption (confidentiality)
  * - Provides integrity (SHA-256 signatures)
- * - Uses Trust-On-First-Use (TOFU) for peer authentication
+ * - Peer authentication is enforced by secure pairing confirmation plus
+ *   certificate fingerprint pinning (not CA validation)
  *
  * Usage:
  * @code
@@ -157,10 +158,10 @@ public:
 
     /**
      * @brief Get default certificate directory
-     * @return Path to %APPDATA%\ExoSend\certs\
+     * @return Path to %LOCALAPPDATA%\ExoSend\certs\
      *
-     * Uses SHGetFolderPathA to get APPDATA folder.
-     * Fallback to "./certs" if APPDATA unavailable.
+     * Uses Windows Known Folder APIs to locate LocalAppData.
+     * Fallback to "./certs" if LocalAppData unavailable.
      *
      * @return Certificate directory path
      */
@@ -170,7 +171,7 @@ public:
      * @brief Get certificate file path
      * @return Full path to server.crt
      *
-     * Returns: %APPDATA%\ExoSend\certs\server.crt
+     * Returns: %LOCALAPPDATA%\ExoSend\certs\server.crt
      *
      * @return Certificate file path
      */
@@ -180,7 +181,7 @@ public:
      * @brief Get private key file path
      * @return Full path to server.key
      *
-     * Returns: %APPDATA%\ExoSend\certs\server.key
+     * Returns: %LOCALAPPDATA%\ExoSend\certs\server.key
      *
      * @return Private key file path
      */

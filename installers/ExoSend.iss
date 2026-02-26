@@ -7,11 +7,11 @@
 
 ; Application Information
 AppName=ExoSend
-AppVersion=0.2.0
+AppVersion=0.3.0
 AppPublisher=ExoSend Project
-AppPublisherURL=https://github.com/yourusername/exosend
-AppSupportURL=https://github.com/yourusername/exosend/issues
-AppUpdatesURL=https://github.com/yourusername/exosend/releases
+AppPublisherURL=https://github.com/AlexZechariah/exosend
+AppSupportURL=https://github.com/AlexZechariah/exosend/issues
+AppUpdatesURL=https://github.com/AlexZechariah/exosend/releases
 AppCopyright=Copyright (C) 2026
 AppContact=exosend@example.com
 DefaultDirName={commonpf}\ExoSend
@@ -42,7 +42,7 @@ PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 
 ; Build Information
-VersionInfoVersion=0.2.0.0
+VersionInfoVersion=0.3.0.0
 VersionInfoCompany=ExoSend Project
 VersionInfoDescription=ExoSend
 VersionInfoCopyright=Copyright (C) 2026
@@ -103,9 +103,10 @@ Filename: "{tmp}\VC_redist.x64.exe"; \
     AfterInstall: VCRedistInstallEnd
 
 ; Add Windows Firewall Rule (if selected)
-Filename: "netsh.exe"; \
-    Parameters: "advfirewall firewall add rule ""name=ExoSend"" dir=in action=allow program=""{app}\ExoSend.exe"" enable=yes profile=any"; \
-    StatusMsg: "Adding Windows Firewall rule..."; \
+; v0.3: Uses program-based rules (Private+Domain+LocalSubnet) via ExoSendFirewallHelper.
+Filename: "{app}\ExoSendFirewallHelper.exe"; \
+    Parameters: "--install"; \
+    StatusMsg: "Adding Windows Firewall rules..."; \
     Flags: runhidden; \
     Tasks: firewall
 
@@ -115,11 +116,11 @@ Filename: "{app}\ExoSend.exe"; \
     Flags: nowait postinstall skipifsilent
 
 [UninstallRun]
-; Remove Windows Firewall Rule
-Filename: "netsh.exe"; \
-    Parameters: "advfirewall firewall delete rule ""name=ExoSend"""; \
+; Remove Windows Firewall Rules (v0.3 program rules + legacy v0.2 port rules)
+Filename: "{app}\ExoSendFirewallHelper.exe"; \
+    Parameters: "--remove"; \
     Flags: runhidden; \
-    RunOnceId: "DeleteFirewallRule"
+    RunOnceId: "RemoveFirewallRules"
 
 [UninstallDelete]
 ; Delete Application Directory (if empty)
@@ -141,7 +142,7 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 ; Application Settings (Store installation path)
 Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "Version"; ValueData: "0.2.0"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "Version"; ValueData: "0.3.0"; Flags: uninsdeletekey
 
 [Dirs]
 ; Create required directories (these should already exist from Files section, but ensuring them)

@@ -3,7 +3,7 @@
  * @brief Settings persistence manager for ExoSend GUI application
  *
  * This class manages application settings persistence using JSON files.
- * Settings are stored in %APPDATA%\ExoSend\config.json on Windows.
+ * Settings are stored in %LOCALAPPDATA%\ExoSend\config.json on Windows.
  *
  * (c) 2026 ExoSend Project
  * Licensed under MIT License
@@ -94,6 +94,20 @@ public:
     bool getShowCloseWarning() const;
 
     /**
+     * @brief Get whether crash dumps are enabled (privacy control)
+     *
+     * When disabled, ExoSend will not write crash dumps or crash logs.
+     */
+    bool getEnableCrashDumps() const;
+
+    /**
+     * @brief Enable or disable crash dumps (privacy control)
+     *
+     * Settings are auto-saved on change.
+     */
+    void setEnableCrashDumps(bool enabled);
+
+    /**
      * @brief Get the peer timeout in seconds
      * @return Peer timeout value (1-10 seconds, default 3)
      */
@@ -143,6 +157,28 @@ public:
                             const QString& fingerprintSha256Hex,
                             const QString& displayName);
     void updatePeerSeen(const QString& peerUuid, const QString& displayName);
+
+    /**
+     * @brief Revoke a previously pinned peer from the trust store.
+     * @param peerUuid UUID of the peer to remove.
+     * @return true if the peer existed and was removed.
+     *
+     * Emits settingsChanged() and auto-saves on success.
+     */
+    bool revokePeer(const QString& peerUuid);
+
+    /**
+     * @brief Remove all pinned peers from the trust store.
+     *
+     * Emits settingsChanged() and auto-saves.
+     */
+    void clearAllPeers();
+
+    /**
+     * @brief Get all pinned peers for display in the Settings UI.
+     * @return Copy of the trust store peer map.
+     */
+    ExoSend::TrustStore::Map getTrustedPeers() const;
 
     // ========================================================================
     // Settings Mutators
@@ -262,7 +298,7 @@ private:
      * @brief Get the configuration file path
      * @return Full path to config.json
      *
-     * Returns: %APPDATA%\ExoSend\config.json on Windows
+     * Returns: %LOCALAPPDATA%\ExoSend\config.json on Windows
      */
     QString getConfigFilePath() const;
 
@@ -281,6 +317,7 @@ private:
     QString m_downloadPath;      ///< Where received files are saved
     QByteArray m_windowGeometry; ///< Main window state
     bool m_showCloseWarning;     ///< Whether to show close-to-tray warning
+    bool m_enableCrashDumps;     ///< Whether crash dumps are enabled (privacy control)
     int m_peerTimeout;           ///< Peer timeout in seconds (default 3, range 1-10)
     QMap<QString, bool> m_autoAcceptPeers;  ///< Auto-accept preferences by peer UUID
     ExoSend::TrustStore m_trustStore;  ///< Pairing and pinning trust store

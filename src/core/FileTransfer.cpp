@@ -6,6 +6,9 @@
 #include "exosend/FileTransfer.h"
 #include "exosend/TlsSocket.h"
 #include "exosend/TransportStream.h"
+#include "exosend/AtomicFile.h"
+#include "exosend/WindowsFilename.h"
+#include "exosend/WinSafeFile.h"
 
 #include <fstream>
 #include <filesystem>
@@ -457,10 +460,12 @@ FileReceiver::FileReceiver(const std::string& downloadDir)
 
 FileReceiver::~FileReceiver()
 {
+#ifndef _WIN32
     // Close file if still open
     if (m_outputFile.is_open()) {
         m_outputFile.close();
     }
+#endif
 }
 
 FileReceiver::FileReceiver(FileReceiver&&) noexcept = default;
@@ -573,6 +578,19 @@ bool FileReceiver::receiveFile(TransportStream& stream,
             deletePartialFile();
             return false;
         }
+    }
+
+    // Atomic finalize: rename temp file into place only after hash verification.
+    {
+        std::string renameError;
+        if (!atomicRenameToFinal(std::filesystem::path(m_tempOutputPath),
+                                 std::filesystem::path(m_outputPath),
+                                 renameError)) {
+            errorMsg = "Failed to finalize received file: " + renameError;
+            deletePartialFile();
+            return false;
+        }
+        m_tempOutputPath.clear();
     }
 
     return true;
@@ -696,6 +714,19 @@ bool FileReceiver::receiveFile(TransportStream& stream,
         }
     }
 
+    // Atomic finalize: rename temp file into place only after hash verification.
+    {
+        std::string renameError;
+        if (!atomicRenameToFinal(std::filesystem::path(m_tempOutputPath),
+                                 std::filesystem::path(m_outputPath),
+                                 renameError)) {
+            errorMsg = "Failed to finalize received file: " + renameError;
+            deletePartialFile();
+            return false;
+        }
+        m_tempOutputPath.clear();
+    }
+
     return true;
 }
 
@@ -765,11 +796,66 @@ bool FileReceiver::receiveFileData(TransportStream& stream, const ExoHeader& hea
 {
     // Generate unique filename
     m_outputPath = generateUniqueFilename(m_downloadDir, m_fileName);
+    const AtomicFilePaths paths = computeAtomicFilePaths(std::filesystem::path(m_outputPath));
+    m_tempOutputPath = paths.tempPath.string();
 
-    // Open output file
-    m_outputFile.open(m_outputPath, std::ios::binary);
+    // Open output file exclusively (CREATE_NEW) for defense-in-depth.
+#ifdef _WIN32
+    {
+        void* h = nullptr;
+        std::wstring finalResolved;
+        const std::wstring tempWide = paths.tempPath.wstring();
+        if (!createNewWinFileExclusive(tempWide, h, finalResolved, errorMsg)) {
+            errorMsg = "Failed to create output file: " + m_tempOutputPath + " (" + errorMsg + ")";
+            return false;
+        }
+
+        std::wstring dirResolved;
+        const std::wstring dirWide = std::filesystem::path(m_downloadDir).wstring();
+        if (!getFinalPathForDirectory(dirWide, dirResolved, errorMsg)) {
+            closeWinFile(h);
+            errorMsg = "Failed to resolve download directory path: " + errorMsg;
+            return false;
+        }
+
+        auto ensureTrailingBackslash = [](std::wstring& s) {
+            if (!s.empty() && s.back() != L'\\' && s.back() != L'/') {
+                s.push_back(L'\\');
+            }
+        };
+
+        ensureTrailingBackslash(dirResolved);
+
+        auto toUpper = [](std::wstring_view s) {
+            std::wstring out;
+            out.reserve(s.size());
+            for (wchar_t ch : s) {
+                if (ch >= L'a' && ch <= L'z') {
+                    out.push_back(static_cast<wchar_t>(ch - (L'a' - L'A')));
+                } else {
+                    out.push_back(ch);
+                }
+            }
+            return out;
+        };
+
+        const std::wstring dirUpper = toUpper(dirResolved);
+        const std::wstring fileUpper = toUpper(finalResolved);
+
+        if (fileUpper.rfind(dirUpper, 0) != 0) {
+            closeWinFile(h);
+            (void)std::filesystem::remove(paths.tempPath);
+            errorMsg = "Resolved output path is outside download directory (reparse/path confusion)";
+            return false;
+        }
+
+        m_outputHandle.handle = h;
+        m_fileCreated = true;
+    }
+#else
+    m_outputFile.open(m_tempOutputPath, std::ios::binary);
     if (!m_outputFile) {
-        errorMsg = "Failed to create output file: " + m_outputPath;
+        errorMsg = "Failed to create output file: " + m_tempOutputPath;
         return false;
     }
     m_fileCreated = true;
@@ -777,6 +863,7 @@ bool FileReceiver::receiveFileData(TransportStream& stream, const ExoHeader& hea
     // Increase file stream buffering for large sequential writes
     std::vector<char> outIoBuffer(1024 * 1024);
     (void)m_outputFile.rdbuf()->pubsetbuf(outIoBuffer.data(), static_cast<std::streamsize>(outIoBuffer.size()));
+#endif
 
     // Reset hash
     if (!m_incrementalHash.reset()) {
@@ -805,12 +892,20 @@ bool FileReceiver::receiveFileData(TransportStream& stream, const ExoHeader& hea
         }
 
         // Write to file
+#ifdef _WIN32
+        if (!writeAllWinFile(m_outputHandle.handle, buffer.data(), toRead, errorMsg)) {
+            errorMsg = "Failed to write to file: " + errorMsg;
+            deletePartialFile();
+            return false;
+        }
+#else
         m_outputFile.write(reinterpret_cast<const char*>(buffer.data()), toRead);
         if (!m_outputFile) {
             errorMsg = "Failed to write to file";
             deletePartialFile();
             return false;
         }
+#endif
 
         // Update hash
         if (!updateHash(buffer.data(), toRead)) {
@@ -829,7 +924,11 @@ bool FileReceiver::receiveFileData(TransportStream& stream, const ExoHeader& hea
     }
 
     // Close file
+#ifdef _WIN32
+    closeWinFile(m_outputHandle.handle);
+#else
     m_outputFile.close();
+#endif
 
     // Finalize hash
     if (!m_incrementalHash.finalize(m_sha256Hash)) {
@@ -843,33 +942,7 @@ bool FileReceiver::receiveFileData(TransportStream& stream, const ExoHeader& hea
 
 bool FileReceiver::sanitizeFilename(std::string& filename)
 {
-    if (filename.empty()) {
-        return false;
-    }
-
-    // Remove path separators
-    size_t pos = 0;
-    while ((pos = filename.find_first_of("/\\", pos)) != std::string::npos) {
-        filename[pos] = '_';
-    }
-
-    // Remove relative path indicators
-    pos = 0;
-    while ((pos = filename.find("..", pos)) != std::string::npos) {
-        filename.replace(pos, 2, "__");
-    }
-
-    // Remove drive letters (Windows)
-    if (filename.length() >= 2 && filename[1] == ':') {
-        filename[0] = '_';
-    }
-
-    // Check if filename is now empty or just dots
-    if (filename.empty() || filename.find_first_not_of("._") == std::string::npos) {
-        return false;
-    }
-
-    return true;
+    return sanitizeWindowsFilenameInPlace(filename);
 }
 
 std::string FileReceiver::generateUniqueFilename(const std::string& directory,
@@ -903,15 +976,21 @@ std::string FileReceiver::generateUniqueFilename(const std::string& directory,
 
 bool FileReceiver::deletePartialFile()
 {
-    if (m_fileCreated && !m_outputPath.empty()) {
+    const std::string pathToDelete = !m_tempOutputPath.empty() ? m_tempOutputPath : m_outputPath;
+
+    if (m_fileCreated && !pathToDelete.empty()) {
         // Close file if open
+#ifdef _WIN32
+        closeWinFile(m_outputHandle.handle);
+#else
         if (m_outputFile.is_open()) {
             m_outputFile.close();
         }
+#endif
 
         // Delete file
         try {
-            return std::filesystem::remove(m_outputPath);
+            return std::filesystem::remove(pathToDelete);
         } catch (...) {
             return false;
         }

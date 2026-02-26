@@ -16,6 +16,7 @@
 #include <QListView>
 #include <QLabel>
 #include "exosend/QtUi/DragDropListView.h"
+#include "exosend/PairingPromptLimiter.h"
 #include <QSplitter>
 #include <QMenuBar>
 #include <QStatusBar>
@@ -283,6 +284,10 @@ private:
     /**
      * @brief Handle pending incoming transfer (shows dialog)
      * @param clientIp Sender's IP address
+     * @param peerName Best-effort display name (for UX only)
+     * @param peerUuid Sender device UUID (identity key for trust and auto-accept)
+     * @param peerPort Sender's advertised TCP port (for display)
+     * @param peerFingerprintSha256Hex Peer TLS certificate fingerprint (canonical hex)
      * @param filename File name
      * @param fileSize File size in bytes
      * @param pendingSessionId Pending session ID
@@ -290,9 +295,36 @@ private:
      */
     bool handlePendingIncomingTransfer(
         const QString& clientIp,
+        const QString& peerName,
+        const QString& peerUuid,
+        quint16 peerPort,
+        const QString& peerFingerprintSha256Hex,
         const QString& filename,
         qint64 fileSize,
         const QString& pendingSessionId
+    );
+
+    /**
+     * @brief Perform maximum-security pairing with a peer (PAIR_REQ/PAIR_RESP over TLS).
+     *
+     * This is used to eliminate TOFU-only pairing by requiring an out-of-band
+     * high-entropy pairing code bound to the TLS channel binding (tls-exporter).
+     *
+     * On success, this pins the peer certificate fingerprint in SettingsManager.
+     *
+     * @param peerUuid Peer UUID from discovery.
+     * @param peerName Display name (UX only).
+     * @param peerIp Peer IP address.
+     * @param peerPort Peer TCP port.
+     * @param outPinnedFingerprint Output pinned fingerprint (canonical SHA-256 hex).
+     * @return true if pairing succeeded and peer is now pinned.
+     */
+    bool pairPeerSecurely(
+        const QString& peerUuid,
+        const QString& peerName,
+        const QString& peerIp,
+        quint16 peerPort,
+        QString& outPinnedFingerprint
     );
 
     /**
@@ -330,7 +362,9 @@ private:
     DragDropListView* m_peerListView; ///< Peer list view with drag-drop support
     QListView* m_transferListView;    ///< Transfer list view
     QWidget* m_peerListWidget;        ///< Peer list container (for drag-drop)
-    QLabel* m_statusLabel;            ///< Status bar label
+    QLabel* m_statusLabel;            ///< Status bar label (transient messages)
+    QLabel* m_portInfoLabel;          ///< Port info label (Discovery: UDP N | Transfer: TCP M)
+    QLabel* m_networkWarningLabel;    ///< Warning icon shown when on a Public network
     QLabel* m_peerCountLabel;         ///< Peer count label (permanent)
     QLabel* m_transferSummaryLabel;   ///< Transfer summary label
 
@@ -387,6 +421,12 @@ private:
 
     // Cleanup timer for completed sessions tracker
     QTimer* m_cleanupTimer; ///< Timer for cleaning up completed sessions tracker
+
+    // ========================================================================
+    // Security: Pairing dialog rate-limiter (v0.3.0)
+    // ========================================================================
+    ExoSend::PairingPromptLimiter m_pairingLimiter; ///< Prevents pairing dialog flooding
+
 signals:
     /**
      * @brief Signal to clean up completed sessions tracker

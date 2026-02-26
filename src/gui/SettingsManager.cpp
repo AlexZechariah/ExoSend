@@ -9,15 +9,56 @@
 #include "exosend/QtUi/SettingsManager.h"
 #include "exosend/FingerprintUtils.h"
 #include "exosend/UuidGenerator.h"
+#include "exosend/ProtectedBlob.h"
+#include "exosend/ThreadSafeLog.h"
+#include "exosend/TrustStoreDpapi.h"
+#include "exosend/WindowsAcl.h"
+#include "exosend/AppPaths.h"
+#include "exosend/MigrationUtils.h"
 #include "exosend/config.h"
 #include <QStandardPaths>
 #include <QDir>
 #include <QFile>
-#include <QTemporaryFile>
+#include <QSaveFile>
 #include <QDateTime>
 #include <QDebug>
 #include <chrono>
+#include <vector>
+#include <filesystem>
 #include <winsock2.h>  // For gethostname
+
+// ========================================================================
+// Anonymous namespace: Windows security helpers
+// ========================================================================
+
+namespace {
+
+static std::string readExistingTrustStoreDpapiBase64(const QString& configPath)
+{
+    QFile f(configPath);
+    if (!f.exists()) {
+        return {};
+    }
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+        return {};
+    }
+
+    const QByteArray data = f.readAll();
+    f.close();
+
+    json j = json::parse(data.constData(), nullptr, false);
+    if (j.is_discarded() || !j.is_object()) {
+        return {};
+    }
+
+    if (j.contains("trust_store_dpapi") && j["trust_store_dpapi"].is_string()) {
+        return j["trust_store_dpapi"].get<std::string>();
+    }
+
+    return {};
+}
+
+} // anonymous namespace
 
 // ========================================================================
 // Constructor / Destructor
@@ -30,6 +71,7 @@ SettingsManager::SettingsManager(QObject* parent)
     , m_downloadPath()
     , m_windowGeometry()
     , m_showCloseWarning(true)
+    , m_enableCrashDumps(true)
     , m_peerTimeout(10)  // Default 10 seconds (matches DiscoveryService PEER_TIMEOUT_MS)
     , m_trustStore()
     , m_maxIncomingSizeBytes(ExoSend::DEFAULT_MAX_INCOMING_SIZE_BYTES)
@@ -74,6 +116,11 @@ QByteArray SettingsManager::getWindowGeometry() const
 bool SettingsManager::getShowCloseWarning() const
 {
     return m_showCloseWarning;
+}
+
+bool SettingsManager::getEnableCrashDumps() const
+{
+    return m_enableCrashDumps;
 }
 
 int SettingsManager::getPeerTimeout() const
@@ -122,6 +169,15 @@ void SettingsManager::setShowCloseWarning(bool show)
 {
     if (m_showCloseWarning != show) {
         m_showCloseWarning = show;
+        emit settingsChanged();
+        saveSettings();
+    }
+}
+
+void SettingsManager::setEnableCrashDumps(bool enabled)
+{
+    if (m_enableCrashDumps != enabled) {
+        m_enableCrashDumps = enabled;
         emit settingsChanged();
         saveSettings();
     }
@@ -190,6 +246,28 @@ void SettingsManager::updatePeerSeen(const QString& peerUuid, const QString& dis
     saveSettings();
 }
 
+bool SettingsManager::revokePeer(const QString& peerUuid)
+{
+    bool removed = m_trustStore.revokePeer(peerUuid.toStdString());
+    if (removed) {
+        emit settingsChanged();
+        saveSettings();
+    }
+    return removed;
+}
+
+void SettingsManager::clearAllPeers()
+{
+    m_trustStore.clear();
+    emit settingsChanged();
+    saveSettings();
+}
+
+ExoSend::TrustStore::Map SettingsManager::getTrustedPeers() const
+{
+    return m_trustStore.records();
+}
+
 bool SettingsManager::getAutoAcceptForPeer(const QString& peerUuid) const
 {
     return m_autoAcceptPeers.value(peerUuid, false);
@@ -216,8 +294,32 @@ QMap<QString, bool> SettingsManager::getAllAutoAcceptPreferences() const
 
 bool SettingsManager::loadSettings()
 {
-    QString configPath = getConfigFilePath();
+    const QString configPath = getConfigFilePath();
     QFile configFile(configPath);
+
+#ifdef _WIN32
+    // One-time migration: if the canonical config.json is missing, attempt to migrate
+    // from the legacy Qt-derived path (%LOCALAPPDATA%\ExoSend\ExoSend\config.json).
+    // Skip migration when EXOSEND_CONFIG_DIR is set to avoid surprising dev/test overrides.
+    const QString overrideDir = qEnvironmentVariable("EXOSEND_CONFIG_DIR").trimmed();
+    if (overrideDir.isEmpty()) {
+        const auto legacy = ExoSend::AppPaths::legacyQtAppLocalConfigJsonPath();
+        if (!legacy.empty()) {
+            const std::filesystem::path dest = ExoSend::AppPaths::configJsonPath();
+            const auto r = ExoSend::MigrationUtils::migrateFileIfDestMissing(dest, legacy);
+            if (!r.ok) {
+                ExoSend::ThreadSafeLog::log(
+                    "SETTINGS_MIGRATE_WARN: failed to migrate legacy config.json: " + r.error);
+            } else if (r.migrated) {
+                ExoSend::ThreadSafeLog::log(
+                    "SETTINGS_MIGRATE: migrated config.json to canonical path");
+
+                std::wstring aclErr;
+                (void)ExoSend::restrictPathToCurrentUser(dest.wstring(), &aclErr);
+            }
+        }
+    }
+#endif
 
     // Check if config file exists
     if (!configFile.exists()) {
@@ -278,6 +380,12 @@ bool SettingsManager::loadSettings()
             m_showCloseWarning = true;  // Default to true for first-time users
         }
 
+        if (j.contains("enable_crash_dumps") && j["enable_crash_dumps"].is_boolean()) {
+            m_enableCrashDumps = j["enable_crash_dumps"].get<bool>();
+        } else {
+            m_enableCrashDumps = true;
+        }
+
         if (j.contains("peer_timeout") && j["peer_timeout"].is_number_integer()) {
             int timeout = j["peer_timeout"].get<int>();
             // Clamp to valid range
@@ -292,14 +400,42 @@ bool SettingsManager::loadSettings()
             auto peersObj = j["auto_accept_peers"];
             for (auto it = peersObj.begin(); it != peersObj.end(); ++it) {
                 QString uuid = QString::fromStdString(it.key());
-                bool enabled = it.value().get<bool>();
-                m_autoAcceptPeers[uuid] = enabled;
+                if (it.value().is_boolean()) {
+                    m_autoAcceptPeers[uuid] = it.value().get<bool>();
+                }
             }
         }
 
-        // Load trust store (pairing + pinning)
-        if (j.contains("trust_store")) {
+        // Load trust store (DPAPI-encrypted blob preferred; plaintext fallback for v0.2 migration)
+        if (j.contains("trust_store_dpapi") && j["trust_store_dpapi"].is_string()) {
+            const std::string b64 = j["trust_store_dpapi"].get<std::string>();
+            const auto ciphertext = ExoSend::ProtectedBlob::fromBase64(b64);
+            std::string decryptError;
+            const std::string plaintext = ExoSend::ProtectedBlob::unprotect(ciphertext, decryptError);
+            if (!plaintext.empty()) {
+                try {
+                    const auto jTrust = nlohmann::json::parse(plaintext);
+                    m_trustStore = ExoSend::TrustStore::fromJson(jTrust);
+                } catch (...) {
+                    // Corrupted or tampered blob: start with empty trust store
+                    ExoSend::ThreadSafeLog::log(
+                        "TRUST_LOAD_ERROR: DPAPI blob parsed but JSON invalid; starting empty");
+                    m_trustStore = ExoSend::TrustStore{};
+                }
+            } else {
+                // DPAPI failed (different user profile, re-image, etc.)
+                ExoSend::ThreadSafeLog::log(
+                    "TRUST_LOAD_ERROR: DPAPI decrypt failed (" + decryptError +
+                    "); trust store starting empty");
+                m_trustStore = ExoSend::TrustStore{};
+            }
+        } else if (j.contains("trust_store") && j["trust_store"].is_object()) {
+            // v0.2.0 migration path: import plaintext trust store once.
+            // saveSettings() will re-save it as a DPAPI blob and drop this key.
             m_trustStore = ExoSend::TrustStore::fromJson(j["trust_store"]);
+            ExoSend::ThreadSafeLog::log(
+                "TRUST_MIGRATE: imported plaintext trust_store from v0.2; "
+                "will be re-saved as DPAPI blob");
         }
 
         // Load max incoming size
@@ -332,6 +468,9 @@ bool SettingsManager::saveSettings()
         return false;
     }
 
+    const std::string existingTrustStoreDpapiBase64 =
+        readExistingTrustStoreDpapiBase64(configPath);
+
     // Build JSON object
     json j;
     j["device_uuid"] = m_deviceUuid.toStdString();
@@ -339,6 +478,7 @@ bool SettingsManager::saveSettings()
     j["download_path"] = m_downloadPath.toStdString();
     j["window_geometry"] = m_windowGeometry.toBase64().toStdString();
     j["show_close_warning"] = m_showCloseWarning;
+    j["enable_crash_dumps"] = m_enableCrashDumps;
     j["peer_timeout"] = m_peerTimeout;
     j["max_incoming_size_bytes"] = m_maxIncomingSizeBytes;
 
@@ -349,49 +489,76 @@ bool SettingsManager::saveSettings()
     }
     j["auto_accept_peers"] = autoAcceptObj;
 
-    // Save trust store
-    j["trust_store"] = m_trustStore.toJson();
+    // Save trust store encrypted with DPAPI (user-scoped, v0.3+)
+    // The plaintext "trust_store" key from v0.2 is deliberately omitted here;
+    // it will disappear from the file on the next save after migration.
+    j["settings_version"] = "0.3";
+    {
+        const std::string trustJson = m_trustStore.toJson().dump();
+        const bool trustStoreEmpty = m_trustStore.records().empty();
+
+        const auto r = ExoSend::protectTrustStoreJsonToBase64(
+            trustJson,
+            existingTrustStoreDpapiBase64,
+            [](const std::string& plaintext, std::string& errorMsg) -> std::vector<uint8_t> {
+                return ExoSend::ProtectedBlob::protect(plaintext, errorMsg);
+            }
+        );
+
+        if (r.ok) {
+            j["trust_store_dpapi"] = r.trustStoreDpapiBase64;
+            if (r.usedExisting) {
+                ExoSend::ThreadSafeLog::log(
+                    "TRUST_SAVE_ERROR: DPAPI protect failed (" + r.error +
+                    "); preserving existing trust store on disk");
+            }
+        } else {
+            // Fail closed: never write pinned fingerprints in plaintext.
+            // If we cannot protect AND we have no existing encrypted trust store,
+            // refuse to overwrite the settings file when the trust store is non-empty.
+            if (!existingTrustStoreDpapiBase64.empty()) {
+                j["trust_store_dpapi"] = existingTrustStoreDpapiBase64;
+                ExoSend::ThreadSafeLog::log(
+                    "TRUST_SAVE_ERROR: DPAPI protect failed (" + r.error +
+                    "); preserving existing trust store on disk");
+            } else if (!trustStoreEmpty) {
+                ExoSend::ThreadSafeLog::log(
+                    "TRUST_SAVE_ERROR: DPAPI protect failed (" + r.error +
+                    "); refusing to write plaintext trust store");
+                return false;
+            }
+        }
+    }
 
     // Get JSON string
     std::string jsonString = j.dump(4);  // 4-space indentation for readability
 
-    // Write atomically: use temp file then rename
-    // Use QTemporaryFile without template string for better Windows compatibility
-    QTemporaryFile tempFile;
-    tempFile.setAutoRemove(false);
-
-    if (!tempFile.open()) {
+    // Write atomically (same directory, durable rename semantics).
+    // QSaveFile writes to a temp file in the destination directory and commits via rename.
+    QSaveFile out(configPath);
+    if (!out.open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
         return false;
     }
 
-    // Write JSON data
-    qint64 bytesWritten = tempFile.write(jsonString.c_str(), jsonString.length());
+    const qint64 bytesWritten = out.write(jsonString.c_str(), jsonString.length());
     if (bytesWritten != static_cast<qint64>(jsonString.length())) {
-        tempFile.close();
         return false;
     }
 
-    // Ensure data is flushed to disk
-    tempFile.flush();
-    QString tempFilePath = tempFile.fileName();
-    tempFile.close();
-
-    // Remove existing config file if it exists
-    if (QFile::exists(configPath)) {
-        if (!QFile::remove(configPath)) {
-            QFile::remove(tempFilePath);  // Clean up temp file
-            return false;
-        }
-    }
-
-    // Copy temp file to config location
-    if (!QFile::copy(tempFilePath, configPath)) {
-        QFile::remove(tempFilePath);  // Clean up temp file
+    if (!out.commit()) {
         return false;
     }
 
-    // Clean up temp file
-    QFile::remove(tempFilePath);
+    // Restrict config file ACL to the current Windows user (defense-in-depth).
+    // Failure is non-fatal: the file is written correctly regardless.
+#ifdef _WIN32
+    std::wstring aclErr;
+    if (!ExoSend::restrictPathToCurrentUser(configPath.toStdWString(), &aclErr)) {
+        ExoSend::ThreadSafeLog::log(
+            "SETTINGS_ACL_WARN: failed to restrict config.json ACL: " +
+            std::string(aclErr.begin(), aclErr.end()));
+    }
+#endif
 
     return true;
 }
@@ -417,6 +584,9 @@ void SettingsManager::resetToDefaults()
 
     m_windowGeometry.clear();
 
+    // Crash dumps enabled by default (privacy control).
+    m_enableCrashDumps = true;
+
     // Reset peer timeout to default
     m_peerTimeout = 10;  // Default 10 seconds (matches DiscoveryService PEER_TIMEOUT_MS)
 
@@ -436,6 +606,23 @@ QString SettingsManager::generateUuid() const
 
 QString SettingsManager::getConfigFilePath() const
 {
+    // Developer/test override.
+    const QString overrideDir = qEnvironmentVariable("EXOSEND_CONFIG_DIR").trimmed();
+    if (!overrideDir.isEmpty()) {
+        if (overrideDir.endsWith(".json", Qt::CaseInsensitive)) {
+            return overrideDir;
+        }
+        return QDir(overrideDir).filePath("config.json");
+    }
+
+#ifdef _WIN32
+    const auto p = ExoSend::AppPaths::configJsonPath();
+    if (!p.empty()) {
+        return QString::fromStdWString(p.wstring());
+    }
+#endif
+
+    // Non-Windows fallback: keep Qt behavior for portability.
     QString configDir = QStandardPaths::writableLocation(QStandardPaths::AppLocalDataLocation);
     if (configDir.isEmpty()) {
         configDir = QDir::homePath() + "/.config/ExoSend";

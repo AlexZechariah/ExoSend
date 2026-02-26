@@ -48,6 +48,18 @@ public:
     bool isPinnedFingerprintMatch(const std::string& peerUuid,
                                   const std::string& fingerprintSha256Hex) const;
 
+    /**
+     * @brief Remove a pinned peer from the trust store.
+     * @param peerUuid UUID of the peer to revoke.
+     * @return true if the peer was found and removed, false if not found.
+     */
+    bool revokePeer(const std::string& peerUuid);
+
+    /**
+     * @brief Remove all pinned peers from the trust store.
+     */
+    void clear();
+
     nlohmann::json toJson() const;
     static TrustStore fromJson(const nlohmann::json& j);
 

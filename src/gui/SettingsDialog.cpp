@@ -8,12 +8,15 @@
 
 #include "exosend/QtUi/SettingsDialog.h"
 #include "exosend/QtUi/SettingsManager.h"
+#include "exosend/FingerprintUtils.h"
 #include <QVBoxLayout>
 #include <QHBoxLayout>
 #include <QFormLayout>
 #include <QFileDialog>
 #include <QDir>
 #include <QFileInfo>
+#include <QDateTime>
+#include <QSpacerItem>
 
 // ========================================================================
 // Constructor / Destructor
@@ -36,11 +39,12 @@ SettingsDialog::SettingsDialog(SettingsManager* settings, QWidget* parent)
     loadSettings();
 
     setWindowTitle("ExoSend Settings");
-    setMinimumWidth(450);
+    setMinimumWidth(520);
+    setMinimumHeight(400);
 }
 
 // ========================================================================
-// Private Slots
+// Private Slots: General tab
 // ========================================================================
 
 void SettingsDialog::onBrowsePath()
@@ -77,8 +81,9 @@ void SettingsDialog::onSave()
     m_settings->setDisplayName(m_displayNameEdit->text());
     m_settings->setDownloadPath(m_downloadPathEdit->text());
     m_settings->setShowCloseWarning(m_showCloseWarningCheckBox->isChecked());
-    // Peer timeout is fixed at 10 seconds - no need to save
-    // m_settings->setPeerTimeout(m_peerTimeoutSlider->value());
+    if (m_enableCrashDumpsCheckBox) {
+        m_settings->setEnableCrashDumps(m_enableCrashDumpsCheckBox->isChecked());
+    }
 
     m_errorLabel->clear();
     accept();
@@ -102,13 +107,145 @@ void SettingsDialog::onReject()
 }
 
 // ========================================================================
+// Private Slots: Trusted Peers tab (v0.3.0)
+// ========================================================================
+
+void SettingsDialog::onRevokePeer()
+{
+    if (!m_trustedPeersList || !m_settings) {
+        return;
+    }
+
+    QListWidgetItem* item = m_trustedPeersList->currentItem();
+    if (!item) {
+        return;
+    }
+
+    const QString peerUuid = item->data(Qt::UserRole).toString();
+    const QString displayName = item->data(Qt::UserRole + 1).toString();
+
+    QMessageBox::StandardButton reply = QMessageBox::question(
+        this,
+        "Revoke Trust",
+        QString("Remove trust for peer \"%1\"?\n\n"
+                "The peer will need to be re-paired on the next connection.")
+            .arg(displayName.isEmpty() ? peerUuid.left(8) : displayName),
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No
+    );
+
+    if (reply == QMessageBox::Yes) {
+        m_settings->revokePeer(peerUuid);
+        refreshTrustedPeersList();
+    }
+}
+
+void SettingsDialog::onClearAllPeers()
+{
+    if (!m_settings) {
+        return;
+    }
+
+    QMessageBox::StandardButton reply = QMessageBox::warning(
+        this,
+        "Clear All Trust",
+        "Remove ALL trusted peers?\n\n"
+        "Every peer will need to be re-paired on next connection.\n"
+        "This cannot be undone.",
+        QMessageBox::Yes | QMessageBox::No,
+        QMessageBox::No
+    );
+
+    if (reply == QMessageBox::Yes) {
+        m_settings->clearAllPeers();
+        refreshTrustedPeersList();
+    }
+}
+
+void SettingsDialog::refreshTrustedPeersList()
+{
+    if (!m_trustedPeersList || !m_settings) {
+        return;
+    }
+
+    m_trustedPeersList->clear();
+
+    const auto peers = m_settings->getTrustedPeers();
+    if (peers.empty()) {
+        QListWidgetItem* placeholder = new QListWidgetItem("(No trusted peers)");
+        placeholder->setFlags(placeholder->flags() & ~Qt::ItemIsSelectable);
+        placeholder->setForeground(Qt::gray);
+        m_trustedPeersList->addItem(placeholder);
+        if (m_revokePeerButton) m_revokePeerButton->setEnabled(false);
+        if (m_clearAllPeersButton) m_clearAllPeersButton->setEnabled(false);
+        return;
+    }
+
+    if (m_clearAllPeersButton) m_clearAllPeersButton->setEnabled(true);
+
+    for (const auto& kv : peers) {
+        const std::string& uuid = kv.first;
+        const auto& rec = kv.second;
+
+        // Build display text: "DisplayName | UUID[:8]... | Last seen: date"
+        const QString displayName = QString::fromStdString(rec.displayName);
+        const QString uuidShort = QString::fromStdString(uuid.substr(0, 8)) + "...";
+        const QString lastSeen = rec.lastSeenIso8601.empty()
+            ? "Unknown"
+            : QString::fromStdString(rec.lastSeenIso8601).left(10);  // YYYY-MM-DD
+
+        const QString labelText = QString("%1  [%2]  Last seen: %3")
+            .arg(displayName.isEmpty() ? "(unnamed)" : displayName)
+            .arg(uuidShort)
+            .arg(lastSeen);
+
+        // Show fingerprint on a second line (first 32 chars, formatted)
+        const QString fpShort = QString::fromStdString(
+            ExoSend::FingerprintUtils::formatForDisplay(rec.pinnedFingerprintSha256Hex)
+        ).left(23) + "...";  // Show first 8 bytes (AA:BB:CC:DD:EE:FF:GG:HH...)
+
+        QListWidgetItem* item = new QListWidgetItem(labelText + "\n  Fingerprint: " + fpShort);
+        item->setData(Qt::UserRole, QString::fromStdString(uuid));
+        item->setData(Qt::UserRole + 1, displayName);
+        m_trustedPeersList->addItem(item);
+    }
+
+    if (m_revokePeerButton) m_revokePeerButton->setEnabled(false);  // Enabled on selection
+}
+
+// ========================================================================
 // Private Methods
 // ========================================================================
 
 void SettingsDialog::setupUi()
 {
-    // Create form layout
-    QFormLayout* formLayout = new QFormLayout();
+    QTabWidget* tabWidget = new QTabWidget(this);
+    tabWidget->addTab(buildGeneralTab(), "General");
+    tabWidget->addTab(buildTrustedPeersTab(), "Trusted Peers");
+
+    QVBoxLayout* mainLayout = new QVBoxLayout(this);
+    mainLayout->addWidget(tabWidget);
+
+    // Dialog buttons (Save / Cancel) are part of the General tab form layout,
+    // but we want them outside the tab for consistent dialog UX.
+    // Re-wire: move the buttonBox row here, after the tabWidget.
+    mainLayout->addWidget(m_buttonBox);
+
+    // Connect signals
+    connect(m_browseButton, &QPushButton::clicked,
+            this, &SettingsDialog::onBrowsePath);
+    connect(m_buttonBox->button(QDialogButtonBox::Save), &QPushButton::clicked,
+            this, &SettingsDialog::onSave);
+    connect(m_buttonBox->button(QDialogButtonBox::Cancel), &QPushButton::clicked,
+            this, &SettingsDialog::onReject);
+    connect(m_downloadPathEdit, &QLineEdit::textChanged,
+            this, &SettingsDialog::validatePath);
+}
+
+QWidget* SettingsDialog::buildGeneralTab()
+{
+    QWidget* tab = new QWidget();
+    QFormLayout* formLayout = new QFormLayout(tab);
 
     // Display name field
     m_displayNameEdit = new QLineEdit();
@@ -120,14 +257,13 @@ void SettingsDialog::setupUi()
     QHBoxLayout* pathLayout = new QHBoxLayout();
     m_downloadPathEdit = new QLineEdit();
     m_downloadPathEdit->setToolTip("Where received files will be saved");
-    m_downloadPathEdit->setReadOnly(false);  // Allow manual editing
+    m_downloadPathEdit->setReadOnly(false);
 
     m_browseButton = new QPushButton("Browse...");
     m_browseButton->setMaximumWidth(100);
 
     pathLayout->addWidget(m_downloadPathEdit);
     pathLayout->addWidget(m_browseButton);
-
     formLayout->addRow("Download Path:", pathLayout);
 
     // Device UUID (read-only, informational)
@@ -137,32 +273,36 @@ void SettingsDialog::setupUi()
     m_uuidLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
     formLayout->addRow("Device UUID:", m_uuidLabel);
 
-    // Spacer
     formLayout->addItem(new QSpacerItem(0, 10, QSizePolicy::Minimum, QSizePolicy::Fixed));
 
     // "Show close warning" checkbox
     m_showCloseWarningCheckBox = new QCheckBox("Show warning when minimizing to tray");
     m_showCloseWarningCheckBox->setToolTip(
-        "When checked, shows a warning the first time you close the window"
-    );
+        "When checked, shows a warning the first time you close the window");
     formLayout->addRow("", m_showCloseWarningCheckBox);
 
-    // Spacer
+    // Crash dumps checkbox (privacy control)
+    m_enableCrashDumpsCheckBox = new QCheckBox("Enable crash dumps (privacy-sensitive)");
+    m_enableCrashDumpsCheckBox->setToolTip(
+        "When enabled, ExoSend may write crash dumps and logs to help debugging.\n"
+        "Crash dumps can contain sensitive in-memory data.\n\n"
+        "Location: %LOCALAPPDATA%\\ExoSend\\crash_dumps\\");
+    formLayout->addRow("", m_enableCrashDumpsCheckBox);
+
     formLayout->addItem(new QSpacerItem(0, 10, QSizePolicy::Minimum, QSizePolicy::Fixed));
 
-    // Peer timeout is now fixed at 10 seconds to match DiscoveryService
-    // Removed user-configurable slider to prevent timeout mismatch
+    // Peer timeout (fixed at 10s)
     QLabel* timeoutLabel = new QLabel("10s (fixed)");
     timeoutLabel->setToolTip("Peers are marked inactive after 10 seconds of no beacon");
-    formLayout->addRow("Peer Timeout (seconds):", timeoutLabel);
+    formLayout->addRow("Peer Timeout:", timeoutLabel);
 
-    // Keep the slider widgets for compatibility but hide them
+    // Hidden slider widgets (kept for ABI compat with existing code that sets them)
     m_peerTimeoutSlider = new QSlider(Qt::Horizontal);
-    m_peerTimeoutSlider->setRange(10, 10);  // Fixed at 10
-    m_peerTimeoutSlider->setEnabled(false);  // Disabled
-    m_peerTimeoutSlider->hide();  // Hidden
+    m_peerTimeoutSlider->setRange(10, 10);
+    m_peerTimeoutSlider->setEnabled(false);
+    m_peerTimeoutSlider->hide();
     m_peerTimeoutValueLabel = new QLabel("10s (fixed)");
-    m_peerTimeoutValueLabel->hide();  // Hidden
+    m_peerTimeoutValueLabel->hide();
 
     // Error label
     m_errorLabel = new QLabel();
@@ -170,35 +310,64 @@ void SettingsDialog::setupUi()
     m_errorLabel->setWordWrap(true);
     formLayout->addRow("", m_errorLabel);
 
-    // Spacer
-    formLayout->addItem(new QSpacerItem(0, 10, QSizePolicy::Minimum, QSizePolicy::Fixed));
-
-    // Dialog buttons
+    // Dialog button box (created here, moved to main layout in setupUi)
     m_buttonBox = new QDialogButtonBox(QDialogButtonBox::Save | QDialogButtonBox::Cancel);
-    formLayout->addRow(m_buttonBox);
 
-    // Main layout
-    QVBoxLayout* mainLayout = new QVBoxLayout(this);
-    mainLayout->addLayout(formLayout);
+    return tab;
+}
+
+QWidget* SettingsDialog::buildTrustedPeersTab()
+{
+    QWidget* tab = new QWidget();
+    QVBoxLayout* layout = new QVBoxLayout(tab);
+
+    // Description label
+    QLabel* descLabel = new QLabel(
+        "Peers you have paired with are listed below. "
+        "Revoking a peer removes its pinned certificate fingerprint -- "
+        "you will be prompted to re-pair on the next connection.");
+    descLabel->setWordWrap(true);
+    descLabel->setStyleSheet("color: gray; font-size: 9pt;");
+    layout->addWidget(descLabel);
+
+    // Trusted peers list
+    m_trustedPeersList = new QListWidget();
+    m_trustedPeersList->setAlternatingRowColors(true);
+    m_trustedPeersList->setSelectionMode(QAbstractItemView::SingleSelection);
+    layout->addWidget(m_trustedPeersList);
+
+    // Action buttons
+    QHBoxLayout* btnLayout = new QHBoxLayout();
+    m_revokePeerButton = new QPushButton("Revoke Selected");
+    m_revokePeerButton->setEnabled(false);
+    m_revokePeerButton->setToolTip("Remove trust for the selected peer");
+
+    m_clearAllPeersButton = new QPushButton("Clear All Pairs");
+    m_clearAllPeersButton->setEnabled(false);
+    m_clearAllPeersButton->setToolTip("Remove all trusted peers (requires re-pairing)");
+    m_clearAllPeersButton->setStyleSheet("color: red;");
+
+    btnLayout->addWidget(m_revokePeerButton);
+    btnLayout->addStretch();
+    btnLayout->addWidget(m_clearAllPeersButton);
+    layout->addLayout(btnLayout);
 
     // Connect signals
-    connect(m_browseButton, &QPushButton::clicked,
-            this, &SettingsDialog::onBrowsePath);
-    connect(m_buttonBox->button(QDialogButtonBox::Save), &QPushButton::clicked,
-            this, &SettingsDialog::onSave);
-    connect(m_buttonBox->button(QDialogButtonBox::Cancel), &QPushButton::clicked,
-            this, &SettingsDialog::onReject);
+    connect(m_revokePeerButton, &QPushButton::clicked,
+            this, &SettingsDialog::onRevokePeer);
+    connect(m_clearAllPeersButton, &QPushButton::clicked,
+            this, &SettingsDialog::onClearAllPeers);
+    connect(m_trustedPeersList, &QListWidget::currentItemChanged,
+            this, [this](QListWidgetItem* current, QListWidgetItem*) {
+                if (m_revokePeerButton) {
+                    // Only enable revoke if a selectable item (not placeholder) is selected.
+                    const bool hasSelection = current &&
+                        (current->flags() & Qt::ItemIsSelectable);
+                    m_revokePeerButton->setEnabled(hasSelection);
+                }
+            });
 
-    // Validate path on text change
-    connect(m_downloadPathEdit, &QLineEdit::textChanged,
-            this, &SettingsDialog::validatePath);
-
-    // Update timeout label when slider changes
-    // Peer timeout is now fixed at 10 seconds - slider connection disabled
-    // connect(m_peerTimeoutSlider, &QSlider::valueChanged,
-    //         this, [this](int value) {
-    //             m_peerTimeoutValueLabel->setText(QString("%1s").arg(value));
-    //         });
+    return tab;
 }
 
 void SettingsDialog::loadSettings()
@@ -207,40 +376,34 @@ void SettingsDialog::loadSettings()
         return;
     }
 
-    m_displayNameEdit->setText(m_settings->getDisplayName());
-    m_downloadPathEdit->setText(m_settings->getDownloadPath());
-    m_uuidLabel->setText(m_settings->getDeviceUuid());
-    m_showCloseWarningCheckBox->setChecked(m_settings->getShowCloseWarning());
+    if (m_displayNameEdit) m_displayNameEdit->setText(m_settings->getDisplayName());
+    if (m_downloadPathEdit) m_downloadPathEdit->setText(m_settings->getDownloadPath());
+    if (m_uuidLabel) m_uuidLabel->setText(m_settings->getDeviceUuid());
+    if (m_showCloseWarningCheckBox) {
+        m_showCloseWarningCheckBox->setChecked(m_settings->getShowCloseWarning());
+    }
+    if (m_enableCrashDumpsCheckBox) {
+        m_enableCrashDumpsCheckBox->setChecked(m_settings->getEnableCrashDumps());
+    }
 
-    // Peer timeout is fixed at 10 seconds - no need to load from settings
-    // m_peerTimeoutSlider->setValue(m_settings->getPeerTimeout());
-    // m_peerTimeoutValueLabel->setText(QString("%1s").arg(m_settings->getPeerTimeout()));
+    refreshTrustedPeersList();
 }
 
 bool SettingsDialog::isDisplayNameValid() const
 {
-    QString name = m_displayNameEdit->text().trimmed();
-    return !name.isEmpty();
+    if (!m_displayNameEdit) return false;
+    return !m_displayNameEdit->text().trimmed().isEmpty();
 }
 
 bool SettingsDialog::isDownloadPathValid() const
 {
+    if (!m_downloadPathEdit) return false;
     QString path = m_downloadPathEdit->text();
-
-    if (path.isEmpty()) {
-        return false;
-    }
+    if (path.isEmpty()) return false;
 
     QDir dir(path);
-    if (!dir.exists()) {
-        return false;
-    }
+    if (!dir.exists()) return false;
 
-    // Check if writable by testing file creation
     QFileInfo fi(path);
-    if (!fi.isWritable()) {
-        return false;
-    }
-
-    return true;
+    return fi.isWritable();
 }

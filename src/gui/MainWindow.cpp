@@ -15,14 +15,27 @@
 #include "exosend/QtUi/PeerListItemDelegate.h"
 #include "exosend/QtUi/TransferListModel.h"
 #include "exosend/QtUi/TrayIcon.h"
+#include "exosend/QtUi/PlaceholderListView.h"
 #include "exosend/config.h"
 #include "exosend/PeerInfo.h"
 #include "exosend/DiscoveryService.h"
+#include "exosend/FileTransfer.h"
 #include "exosend/TransferServer.h"
 #include "exosend/TransferQueueManager.h"
+#include "exosend/TransferHeader.h"
 #include "exosend/CertificateManager.h"
+#include "exosend/IncomingTransferPolicy.h"
+#include "exosend/PairingConfirm.h"
+#include "exosend/PairingSecret.h"
+#include "exosend/TlsSocket.h"
+#include "exosend/TransportStream.h"
 #include "exosend/Debug.h"
 #include "exosend/ThreadSafeLog.h"
+#include "exosend/AppPaths.h"
+#include "exosend/FingerprintUtils.h"
+#ifdef _WIN32
+#include "exosend/WindowsAcl.h"
+#endif
 // Qt logging category removed - was causing DBG_PRINTEXCEPTION
 // Use LogCrash() macro (ThreadSafeLog) instead
 #include <QApplication>
@@ -41,16 +54,22 @@
 #include <QPointer>
 #include <QProcess>
 #include <QDebug>
+#include <QInputDialog>
 #include <iostream>
 #include <thread>  // For std::this_thread::get_id()
 #include <condition_variable>  // For thread synchronization without Qt BlockingQueuedConnection
 #include <chrono>  // For timeout on condition variable wait
+#include <fstream>
+#include <system_error>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <shellapi.h>
+#include <netlistmgr.h>
 #endif
 
 // ========================================================================
@@ -58,41 +77,71 @@
 // ========================================================================
 
 namespace {
-    static QFile* g_crashLog = nullptr;
-    static QTextStream* g_crashStream = nullptr;
-
-    void OpenCrashLog() {
-        if (!g_crashLog) {
-            QString logPath = QCoreApplication::applicationDirPath() + "/crash_trace.txt";
-            g_crashLog = new QFile(logPath);
-            if (g_crashLog->open(QIODevice::WriteOnly | QIODevice::Append | QIODevice::Text)) {
-                g_crashStream = new QTextStream(g_crashLog);
-                *g_crashStream << QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss.zzz")
-                               << " - === ExoSend START ===" << "\n";
-                g_crashStream->flush();
-            }
-        }
-    }
-
-    void CloseCrashLog() {
-        if (g_crashStream) {
-            *g_crashStream << QDateTime::currentDateTime().toString("yyyy-MM-dd hh:mm:ss.zzz")
-                           << " - === ExoSend NORMAL SHUTDOWN ===" << "\n";
-            g_crashStream->flush();
-            delete g_crashStream;
-            g_crashStream = nullptr;
-        }
-        if (g_crashLog) {
-            g_crashLog->close();
-            delete g_crashLog;
-            g_crashLog = nullptr;
-        }
-    }
-
     // Thread-safe logging macro - uses ThreadSafeLog for all crash logging
-    // Note: OpenCrashLog() and CloseCrashLog() still use g_crashStream for startup/shutdown
     #define LogCrash(msg) ExoSend::ThreadSafeLog::log(msg)
+
+    static std::filesystem::path crashTracePathFs()
+    {
+        return ExoSend::AppPaths::crashTraceLogPath();
+    }
+
+    static void ensureCrashTracePathSecured(const std::filesystem::path& logPath)
+    {
+        if (logPath.empty()) {
+            return;
+        }
+
+        std::error_code ec;
+        std::filesystem::create_directories(logPath.parent_path(), ec);
+
+        // Best-effort create file so ACL can be applied to the file path.
+        std::ofstream f(logPath, std::ios::app);
+        f.close();
+
+#ifdef _WIN32
+        std::wstring aclErr;
+        (void)ExoSend::restrictPathToCurrentUser(logPath.parent_path().wstring(), &aclErr);
+        (void)ExoSend::restrictPathToCurrentUser(logPath.wstring(), &aclErr);
+#endif
+    }
 } // anonymous namespace
+
+// ========================================================================
+// Helpers
+// ========================================================================
+
+#ifdef _WIN32
+// Returns true if any connected network is categorised as Public.
+// Must be called from the Qt main thread (STA COM apartment, set by QApplication).
+// Returns false on any COM failure (fail-safe: do not warn when detection fails).
+static bool activeNetworkIsPublic() {
+    INetworkListManager* pNLM = nullptr;
+    HRESULT hr = CoCreateInstance(
+        CLSID_NetworkListManager, nullptr,
+        CLSCTX_ALL, IID_INetworkListManager,
+        reinterpret_cast<LPVOID*>(&pNLM));
+    if (FAILED(hr) || !pNLM) return false;
+    struct Guard { INetworkListManager* p; ~Guard() { if (p) p->Release(); } } g{pNLM};
+
+    IEnumNetworks* pEnum = nullptr;
+    hr = pNLM->GetNetworks(NLM_ENUM_NETWORK_CONNECTED, &pEnum);
+    if (FAILED(hr) || !pEnum) return false;
+    struct EnumGuard { IEnumNetworks* p; ~EnumGuard() { if (p) p->Release(); } } eg{pEnum};
+
+    bool foundPublic = false;
+    INetwork* pNet = nullptr;
+    ULONG fetched = 0;
+    while (!foundPublic && pEnum->Next(1, &pNet, &fetched) == S_OK && fetched > 0) {
+        NLM_NETWORK_CATEGORY cat;
+        if (SUCCEEDED(pNet->GetCategory(&cat)) && cat == NLM_NETWORK_CATEGORY_PUBLIC) {
+            foundPublic = true;
+        }
+        pNet->Release();
+        fetched = 0;
+    }
+    return foundPublic;
+}
+#endif // _WIN32
 
 // ========================================================================
 // Constructor / Destructor
@@ -130,22 +179,20 @@ MainWindow::MainWindow(SettingsManager* settings, QWidget* parent)
     setupUi();
     connectSignals();
 
+    // Initialize ThreadSafeLog with a pre-computed path BEFORE any worker threads start.
+    // This prevents log() from calling Qt APIs from non-Qt threads, and avoids writing
+    // crash logs into a shared install directory.
+    const auto crashTracePath = crashTracePathFs();
+    ensureCrashTracePathSecured(crashTracePath);
+    ExoSend::ThreadSafeLog::initialize(crashTracePath);
+    LogCrash("=== ExoSend START ===");
+
     // Initialize core services
     if (!initializeServices()) {
         QMessageBox::critical(this, "Initialization Error",
                             "Failed to initialize core services. "
                             "The application may not function correctly.");
     }
-
-    // Trace: Open crash log for Release build
-    OpenCrashLog();
-
-    // Note: Initialize ThreadSafeLog with a pre-computed path BEFORE any worker
-    // threads start. This prevents log() from calling QCoreApplication::applicationDirPath()
-    // from non-Qt threads (listener thread, cleanup thread), which is not thread-safe.
-    ExoSend::ThreadSafeLog::initialize(
-        (QCoreApplication::applicationDirPath() + "/crash_trace.txt").toStdString()
-    );
 
     LogCrash("MainWindow constructed successfully");
 
@@ -156,7 +203,6 @@ MainWindow::~MainWindow()
 {
     LogCrash("MainWindow destructor called");
     LogCrash("=== NORMAL SHUTDOWN ===");
-    CloseCrashLog();
     stopServices();
 }
 
@@ -373,8 +419,8 @@ void MainWindow::onPeerDoubleClicked(const QModelIndex& index)
     QString peerName = index.data(PeerListModel::NameRole).toString();
     QString peerIp = index.data(PeerListModel::IpRole).toString();
 
-    // Show selection feedback in status bar
-    m_statusLabel->setText(QString("Selected: %1 (%2) - Drag files to send")
+    // Show selection feedback in status bar (avoid duplicating drag/drop hints).
+    m_statusLabel->setText(QString("Selected: %1 (%2)")
                           .arg(peerName).arg(peerIp));
 }
 
@@ -428,8 +474,8 @@ void MainWindow::onPeerClicked(const QModelIndex& index)
     QString peerName = index.data(PeerListModel::NameRole).toString();
     QString peerIp = index.data(PeerListModel::IpRole).toString();
 
-    // Show selection feedback in status bar
-    m_statusLabel->setText(QString("Selected: %1 (%2) - Drag files to send")
+    // Show selection feedback in status bar (avoid duplicating drag/drop hints).
+    m_statusLabel->setText(QString("Selected: %1 (%2)")
                           .arg(peerName).arg(peerIp));
 }
 
@@ -543,7 +589,7 @@ void MainWindow::setupUi()
     peerLayout->addWidget(peerLabel);
 
     m_peerListView = new DragDropListView();
-    m_peerListView->setToolTip("Drag files here to send to selected peer");
+    m_peerListView->setToolTip("Select a peer, then drag files here to send.");
 
     // Add visual selection styling
     m_peerListView->setStyleSheet(
@@ -582,7 +628,7 @@ void MainWindow::setupUi()
     transferLabel->setStyleSheet("font-weight: bold;");
     transferLayout->addWidget(transferLabel);
 
-    m_transferListView = new QListView();
+    m_transferListView = new PlaceholderListView("No transfers yet");
     transferLayout->addWidget(m_transferListView);
 
     // Transfer summary
@@ -628,7 +674,7 @@ void MainWindow::createMenuBar()
     m_aboutAction = helpMenu->addAction("&About ExoSend");
     connect(m_aboutAction, &QAction::triggered, [this]() {
         QMessageBox::about(this, "About ExoSend",
-                          "ExoSend v1.0.0\n\n"
+                          "ExoSend v0.3.0\n\n"
                           "Decentralized Local File Transfer\n"
                           "Built with Qt 6 and Modern C++\n\n"
                           "(c) 2026 ExoSend Project");
@@ -645,21 +691,31 @@ void MainWindow::createStatusBar()
 {
     QStatusBar* statusBar = new QStatusBar(this);
 
-    // Peer count label (permanent, left side)
+    // Transient status messages (left side, e.g. "Ready", "Sending...")
+    m_statusLabel = new QLabel("Ready");
+    statusBar->addWidget(m_statusLabel);
+
+    // Dynamic port info — updated after services start (permanent, left of peers)
+    m_portInfoLabel = new QLabel();
+    m_portInfoLabel->setStyleSheet("color: gray; font-size: 10pt;");
+    statusBar->addPermanentWidget(m_portInfoLabel);
+
+    // Network warning icon — shown only when connected to a Public network
+    m_networkWarningLabel = new QLabel("\u26a0");
+    m_networkWarningLabel->setStyleSheet(
+        "color: #cc7700; font-weight: bold; padding: 0 4px;");
+    m_networkWarningLabel->setToolTip(
+        "Warning: Connected to a Public network.\n"
+        "ExoSend firewall rules are installed for Private/Domain networks only.\n"
+        "Discovery and incoming transfers may be blocked by Windows Firewall.\n\n"
+        "Fix: Change this network profile to Private in Windows settings.");
+    m_networkWarningLabel->setVisible(false);
+    statusBar->addPermanentWidget(m_networkWarningLabel);
+
+    // Peer count (permanent)
     m_peerCountLabel = new QLabel("Peers: 0");
     m_peerCountLabel->setStyleSheet("color: gray; font-size: 10pt;");
     statusBar->addPermanentWidget(m_peerCountLabel);
-
-    // Separator
-    statusBar->addPermanentWidget(new QLabel("|"));
-
-    // Transient status messages (center, stretchable)
-    m_statusLabel = new QLabel("Ready");
-    statusBar->addWidget(m_statusLabel, 1);  // Stretch=1 for centering
-
-    // Drag hint (permanent, right)
-    statusBar->addPermanentWidget(new QLabel("|"));
-    statusBar->addPermanentWidget(new QLabel("Drag files to peers to send"));
 
     setStatusBar(statusBar);
 }
@@ -732,10 +788,8 @@ bool MainWindow::initializeServices()
     // Sync display name from settings
     syncDisplayNameToDiscovery();
 
-    // Start discovery
-    if (!m_discovery->start()) {
-        return false;
-    }
+    // NOTE: Discovery will start AFTER the transfer server so we know the TCP
+    // port to advertise in beacons. See the block below m_transferServer->start().
 
     // Create peer model WITH DiscoveryService and SettingsManager pointers
     m_peerModel = new PeerListModel(m_discovery.get(), m_settings.get(), this);
@@ -781,7 +835,7 @@ bool MainWindow::initializeServices()
 
                     // Re-check m_statusLabel before use
                     if (m_statusLabel) {
-                        m_statusLabel->setText(QString("Selected: %1 (%2) - Drag files to send")
+                        m_statusLabel->setText(QString("Selected: %1 (%2)")
                                               .arg(peerName).arg(peerIp));
                     }
                 }
@@ -886,6 +940,7 @@ bool MainWindow::initializeServices()
     // Set download directory from settings
     m_transferServer->setDownloadDir(m_settings->getDownloadPath().toStdString());
     m_transferServer->setMaxIncomingSizeBytes(m_settings->getMaxIncomingSizeBytes());
+    m_transferServer->setLocalDeviceUuid(m_settings->getDeviceUuid().toStdString());
 
     // Set up incoming connection callback
     // Called from a dedicated client thread (spawned by listenerThreadFunc).
@@ -927,18 +982,39 @@ bool MainWindow::initializeServices()
                         m_pendingTransfer.pendingSessionId = qPendingSessionId;
                     }
 
-                    // Pairing + pinning (v0.2.0+)
-                    if (m_settings) {
-                        // Best-effort display name lookup from current peer model
-                        QString displayName = qClientIp;
-                        if (m_peerModel && !qSenderUuid.isEmpty()) {
-                            QModelIndex idx = m_peerModel->findPeerByUuid(qSenderUuid);
-                            if (idx.isValid()) {
-                                displayName = idx.data(PeerListModel::NameRole).toString();
-                            }
+                    // Rate-limit pairing dialogs: reject if another dialog is already showing
+                    // or if this peer is within the post-rejection cooldown window.
+                    if (!m_pairingLimiter.beginPrompt(qSenderUuid.toStdString())) {
+                        ExoSend::ThreadSafeLog::log(
+                            "TRUST_RATE_LIMITED peer=" + qSenderUuid.toStdString() +
+                            " ip=" + qClientIp.toStdString());
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *ready = true;
                         }
+                        cv->notify_one();
+                        return;
+                    }
 
+                    // Pairing + pinning (v0.2.0+)
+                    // Best-effort display name lookup from current peer model (even if unpaired).
+                    QString displayName = qClientIp;
+                    quint16 peerPortForDisplay = 0;
+                    if (m_peerModel && !qSenderUuid.isEmpty()) {
+                        QModelIndex idx = m_peerModel->findPeerByUuid(qSenderUuid);
+                        if (idx.isValid()) {
+                            displayName = idx.data(PeerListModel::NameRole).toString();
+                            peerPortForDisplay = static_cast<quint16>(
+                                idx.data(PeerListModel::PortRole).toUInt());
+                        }
+                    }
+
+                    if (m_settings) {
                         if (qSenderUuid.isEmpty() || qPeerFingerprint.isEmpty()) {
+                            ExoSend::ThreadSafeLog::log(
+                                "TRUST_REJECTED_NO_IDENTITY ip=" + qClientIp.toStdString());
+
                             QMessageBox::critical(
                                 this,
                                 "Untrusted Peer",
@@ -946,6 +1022,7 @@ bool MainWindow::initializeServices()
                                 QMessageBox::Ok
                             );
 
+                            m_pairingLimiter.endPrompt(qSenderUuid.toStdString(), false);
                             {
                                 std::lock_guard<std::mutex> lock(*cvMutex);
                                 *accepted = false;
@@ -955,46 +1032,32 @@ bool MainWindow::initializeServices()
                             return;
                         }
 
+                        // Format fingerprint for human-readable display (colon-separated).
+                        const QString fpDisplay = QString::fromStdString(
+                            ExoSend::FingerprintUtils::formatForDisplay(qPeerFingerprint.toStdString()));
+
                         if (m_settings->isPeerPinned(qSenderUuid)) {
                             const QString expected = m_settings->getPinnedFingerprint(qSenderUuid);
-                            if (!expected.isEmpty() && expected != qPeerFingerprint) {
-                                QMessageBox msgBox(this);
-                                msgBox.setIcon(QMessageBox::Critical);
-                                msgBox.setWindowTitle("Security Warning: Certificate Changed");
-                                msgBox.setText("The peer certificate fingerprint does not match the pinned value.\n\n"
-                                               "This may indicate the peer was reinstalled, or a MITM attempt.\n\n"
-                                               "Expected (pinned):\n" + expected + "\n\n"
-                                               "Actual (peer):\n" + qPeerFingerprint);
-                                QPushButton* rePair = msgBox.addButton("Re-pair", QMessageBox::AcceptRole);
-                                msgBox.addButton(QMessageBox::Cancel);
-                                msgBox.exec();
+                            if (expected.isEmpty() || expected != qPeerFingerprint) {
+                                const QString expectedDisplay = QString::fromStdString(
+                                    ExoSend::FingerprintUtils::formatForDisplay(expected.toStdString()));
 
-                                if (msgBox.clickedButton() != rePair) {
-                                    {
-                                        std::lock_guard<std::mutex> lock(*cvMutex);
-                                        *accepted = false;
-                                        *ready = true;
-                                    }
-                                    cv->notify_one();
-                                    return;
-                                }
+                                QMessageBox::critical(
+                                    this,
+                                    "Security Warning: Untrusted Certificate",
+                                    "Incoming transfer rejected because the peer certificate fingerprint does not match the pinned value.\n\n"
+                                    "This may indicate the peer was reinstalled, or a MITM attempt.\n\n"
+                                    "Expected (pinned):\n" + expectedDisplay + "\n\n"
+                                    "Actual (peer):\n" + fpDisplay + "\n\n"
+                                    "To restore trust, perform secure pairing again using a pairing code."
+                                );
 
-                                m_settings->pinPeerFingerprint(qSenderUuid, qPeerFingerprint, displayName);
-                            }
-                        } else {
-                            QMessageBox msgBox(this);
-                            msgBox.setIcon(QMessageBox::Question);
-                            msgBox.setWindowTitle("Pair New Peer");
-                            msgBox.setText("This is the first time you are receiving a transfer from this peer.\n\n"
-                                           "Peer: " + displayName + "\n"
-                                           "UUID: " + qSenderUuid + "\n\n"
-                                           "Certificate fingerprint (SHA-256):\n" + qPeerFingerprint + "\n\n"
-                                           "Pair and trust this peer?");
-                            QPushButton* pair = msgBox.addButton("Pair", QMessageBox::AcceptRole);
-                            msgBox.addButton(QMessageBox::Cancel);
-                            msgBox.exec();
+                                ExoSend::ThreadSafeLog::log(
+                                    "TRUST_MISMATCH_REJECTED peer=" + qSenderUuid.toStdString() +
+                                    " session=" + qPendingSessionId.toStdString() +
+                                    " expected_fp=" + expected.toStdString().substr(0, 16) + "...");
 
-                            if (msgBox.clickedButton() != pair) {
+                                m_pairingLimiter.endPrompt(qSenderUuid.toStdString(), false);
                                 {
                                     std::lock_guard<std::mutex> lock(*cvMutex);
                                     *accepted = false;
@@ -1003,15 +1066,44 @@ bool MainWindow::initializeServices()
                                 cv->notify_one();
                                 return;
                             }
+                        } else {
+                            QMessageBox::information(
+                                this,
+                                "Unpaired Peer",
+                                "Incoming transfer rejected because this peer is not paired yet.\n\n"
+                                "For maximum security, ExoSend requires secure pairing (pairing code + TLS channel binding) before accepting transfers.\n\n"
+                                "Ask the sender to pair first, then retry the transfer."
+                            );
 
-                            m_settings->pinPeerFingerprint(qSenderUuid, qPeerFingerprint, displayName);
+                            ExoSend::ThreadSafeLog::log(
+                                "TRUST_REJECTED_UNPAIRED peer=" + qSenderUuid.toStdString() +
+                                " ip=" + qClientIp.toStdString());
+
+                            m_pairingLimiter.endPrompt(qSenderUuid.toStdString(), false);
+                            {
+                                std::lock_guard<std::mutex> lock(*cvMutex);
+                                *accepted = false;
+                                *ready = true;
+                            }
+                            cv->notify_one();
+                            return;
                         }
 
                         // Update trust metadata
                         m_settings->updatePeerSeen(qSenderUuid, displayName);
                     }
 
-                    bool result = handlePendingIncomingTransfer(qClientIp, qFilename, qFileSize, qPendingSessionId);
+                    const bool result = handlePendingIncomingTransfer(
+                        qClientIp,
+                        displayName,
+                        qSenderUuid,
+                        peerPortForDisplay,
+                        qPeerFingerprint,
+                        qFilename,
+                        qFileSize,
+                        qPendingSessionId
+                    );
+                    m_pairingLimiter.endPrompt(qSenderUuid.toStdString(), result);
 
                     // Signal the client thread that the decision is ready
                     {
@@ -1035,6 +1127,218 @@ bool MainWindow::initializeServices()
 
             LogCrash("=== pendingTransferCallback After wait ===");
             LogCrash(std::string("  Returning: ") + (*accepted ? "true" : "false"));
+            return *accepted;
+        }
+    );
+
+    // Set up incoming secure pairing callback (PAIR_REQ / PAIR_RESP).
+    // Called from TransferServer's client thread when it receives PacketType::PAIR_REQ.
+    // The callback queues UI prompting to the Qt thread and blocks until the user approves.
+    m_transferServer->setIncomingPairingCallback(
+        [this](
+            const std::string& clientIp,
+            const std::string& clientUuid,
+            const std::string& clientFingerprintSha256Hex,
+            const std::string& serverUuid,
+            const std::string& serverFingerprintSha256Hex,
+            const std::array<uint8_t, 32>& tlsExporterChannelBinding,
+            const std::array<uint8_t, 32>& clientTag,
+            std::array<uint8_t, 32>& outServerTag,
+            std::string& errorMsg
+        ) -> bool {
+            auto cv = std::make_shared<std::condition_variable>();
+            auto cvMutex = std::make_shared<std::mutex>();
+            auto ready = std::make_shared<bool>(false);
+            auto accepted = std::make_shared<bool>(false);
+            auto outTag = std::make_shared<std::array<uint8_t, 32>>();
+            auto outErr = std::make_shared<std::string>();
+
+            const QString qClientIp = QString::fromStdString(clientIp);
+            const QString qClientUuid = QString::fromStdString(clientUuid);
+            const QString qClientFp = QString::fromStdString(clientFingerprintSha256Hex);
+            const QString qServerUuid = QString::fromStdString(serverUuid);
+            const QString qServerFp = QString::fromStdString(serverFingerprintSha256Hex);
+
+            QMetaObject::invokeMethod(this,
+                [this, qClientIp, qClientUuid, qClientFp, qServerUuid, qServerFp,
+                 tlsExporterChannelBinding, clientTag,
+                 cv, cvMutex, ready, accepted, outTag, outErr]() {
+                    // Rate-limit pairing dialogs.
+                    if (!m_pairingLimiter.beginPrompt(qClientUuid.toStdString())) {
+                        ExoSend::ThreadSafeLog::log(
+                            "TRUST_RATE_LIMITED peer=" + qClientUuid.toStdString() +
+                            " ip=" + qClientIp.toStdString());
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *outErr = "Pairing prompt rate-limited";
+                            *ready = true;
+                        }
+                        cv->notify_one();
+                        return;
+                    }
+
+                    QString displayName = qClientIp;
+                    if (m_peerModel && !qClientUuid.isEmpty()) {
+                        QModelIndex idx = m_peerModel->findPeerByUuid(qClientUuid);
+                        if (idx.isValid()) {
+                            displayName = idx.data(PeerListModel::NameRole).toString();
+                        }
+                    }
+
+                    if (!m_settings || qClientUuid.isEmpty() || qClientFp.isEmpty() ||
+                        qServerUuid.isEmpty() || qServerFp.isEmpty()) {
+                        *outErr = "Missing pairing identity fields";
+                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *ready = true;
+                        }
+                        cv->notify_one();
+                        return;
+                    }
+
+                    const QString clientFpDisplay = QString::fromStdString(
+                        ExoSend::FingerprintUtils::formatForDisplay(qClientFp.toStdString()));
+                    const QString serverFpDisplay = QString::fromStdString(
+                        ExoSend::FingerprintUtils::formatForDisplay(qServerFp.toStdString()));
+
+                    bool ok = false;
+                    const QString codeQ = QInputDialog::getText(
+                        this,
+                        "Secure Pairing Request",
+                        "A peer is requesting secure pairing.\n\n"
+                        "Peer: " + displayName + "\n"
+                        "IP: " + qClientIp + "\n"
+                        "UUID: " + qClientUuid + "\n\n"
+                        "Peer certificate fingerprint (SHA-256):\n" + clientFpDisplay + "\n\n"
+                        "Local certificate fingerprint (SHA-256):\n" + serverFpDisplay + "\n\n"
+                        "Enter the secure pairing code shown on the other device:",
+                        QLineEdit::Normal,
+                        "",
+                        &ok
+                    );
+
+                    if (!ok) {
+                        *outErr = "User cancelled pairing";
+                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *ready = true;
+                        }
+                        cv->notify_one();
+                        return;
+                    }
+
+                    std::array<uint8_t, 16> secret{};
+                    std::string parseErr;
+                    if (!ExoSend::PairingSecret::parse128Base32Crockford(codeQ.toStdString(), secret, parseErr)) {
+                        QMessageBox::warning(this, "Invalid Pairing Code",
+                                             "The pairing code is invalid.\n\n" + QString::fromStdString(parseErr));
+                        *outErr = parseErr;
+                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *ready = true;
+                        }
+                        cv->notify_one();
+                        return;
+                    }
+
+                    std::array<uint8_t, 32> confirmKey{};
+                    std::string confirmErr;
+                    if (!ExoSend::PairingConfirm::deriveConfirmKey(secret, tlsExporterChannelBinding, confirmKey, confirmErr)) {
+                        QMessageBox::critical(this, "Pairing Failed",
+                                              "Failed to derive pairing key.\n\n" + QString::fromStdString(confirmErr));
+                        *outErr = confirmErr;
+                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *ready = true;
+                        }
+                        cv->notify_one();
+                        return;
+                    }
+
+                    // Verify the client tag (computed by the requester).
+                    if (!ExoSend::PairingConfirm::verifyTag(
+                            confirmKey,
+                            ExoSend::PairingRole::Client,
+                            qClientUuid.toStdString(),
+                            qClientFp.toStdString(),
+                            qServerUuid.toStdString(),
+                            qServerFp.toStdString(),
+                            clientTag,
+                            confirmErr)) {
+                        QMessageBox::critical(this, "Pairing Failed",
+                                              "Pairing confirmation failed.\n\n" + QString::fromStdString(confirmErr));
+                        *outErr = confirmErr;
+                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *ready = true;
+                        }
+                        cv->notify_one();
+                        return;
+                    }
+
+                    // Compute the server response tag.
+                    if (!ExoSend::PairingConfirm::computeTag(
+                            confirmKey,
+                            ExoSend::PairingRole::Server,
+                            qServerUuid.toStdString(),
+                            qServerFp.toStdString(),
+                            qClientUuid.toStdString(),
+                            qClientFp.toStdString(),
+                            *outTag,
+                            confirmErr)) {
+                        QMessageBox::critical(this, "Pairing Failed",
+                                              "Failed to compute pairing response.\n\n" + QString::fromStdString(confirmErr));
+                        *outErr = confirmErr;
+                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
+                        {
+                            std::lock_guard<std::mutex> lock(*cvMutex);
+                            *accepted = false;
+                            *ready = true;
+                        }
+                        cv->notify_one();
+                        return;
+                    }
+
+                    // Pin after cryptographic confirmation succeeded.
+                    m_settings->pinPeerFingerprint(qClientUuid, qClientFp, displayName);
+                    m_settings->updatePeerSeen(qClientUuid, displayName);
+
+                    ExoSend::ThreadSafeLog::log(
+                        "TRUST_PIN peer=" + qClientUuid.toStdString() +
+                        " fp=" + qClientFp.toStdString().substr(0, 16) + "...");
+
+                    m_pairingLimiter.endPrompt(qClientUuid.toStdString(), true);
+                    {
+                        std::lock_guard<std::mutex> lock(*cvMutex);
+                        *accepted = true;
+                        *ready = true;
+                    }
+                    cv->notify_one();
+                },
+                Qt::QueuedConnection
+            );
+
+            std::unique_lock<std::mutex> lock(*cvMutex);
+            if (!cv->wait_for(lock, std::chrono::seconds(30), [&ready] { return *ready; })) {
+                errorMsg = "Pairing prompt timeout";
+                return false;
+            }
+
+            if (*accepted) {
+                outServerTag = *outTag;
+            }
+            errorMsg = *outErr;
             return *accepted;
         }
     );
@@ -1203,10 +1507,46 @@ bool MainWindow::initializeServices()
         }
     );
 
-    // Start transfer server
+    // Start transfer server (binds to OS-assigned ephemeral TCP port via bind(0)+getsockname).
     if (!m_transferServer->start()) {
         return false;
     }
+
+    // Wire IP validator: reject TCP connections from IPs not in the discovery peer list.
+    // Defense-in-depth: TLS + ExoSend protocol still authenticate all peers.
+    m_transferServer->setIpValidatorCallback(
+        [this](const std::string& ip) {
+            return m_discovery->hasPeerByIp(ip);
+        }
+    );
+
+    // Advertise the OS-assigned TCP port in discovery beacons BEFORE starting discovery.
+    m_discovery->setTcpPort(m_transferServer->getTcpPort());
+
+    // Start discovery (binds first available port from pool 41000-48100).
+    if (!m_discovery->start()) {
+        QMessageBox::critical(this, "ExoSend",
+            "Failed to start the discovery service.\n"
+            "All discovery ports (41000, 42100, 43210, 43500, 45100,\n"
+            "46000, 46100, 47100, 47500, 48100) may already be in use.\n"
+            "Check if another ExoSend instance is already running.");
+        m_transferServer->stop();
+        return false;
+    }
+
+    // Show dynamic ports in the dedicated status bar label (avoids showMessage overlap).
+    m_portInfoLabel->setText(
+        QString("Discovery: UDP %1  |  Transfer: TCP %2")
+            .arg(m_discovery->getBoundDiscoveryPort())
+            .arg(m_transferServer->getTcpPort())
+    );
+
+#ifdef _WIN32
+    // Warn if connected to a Public network via a compact icon in the status bar.
+    if (activeNetworkIsPublic()) {
+        m_networkWarningLabel->setVisible(true);
+    }
+#endif
 
     // Create TransferQueueManager (max concurrent only)
     m_queueManager = std::make_unique<ExoSend::TransferQueueManager>(
@@ -1402,8 +1742,8 @@ void MainWindow::showFirewallDialog()
     dlg.setText("Windows Firewall rules are missing for ExoSend.");
     dlg.setInformativeText(
         "ExoSend needs inbound firewall rules to:\n"
-        "- Discover peers (UDP 8888)\n"
-        "- Receive transfers (TCP 9999)\n\n"
+        "- Discover peers (UDP, auto-selects from port pool 41000-48100)\n"
+        "- Receive transfers (TCP, OS-assigned port)\n\n"
         "You can fix this automatically (requires Administrator approval), "
         "or open Windows Firewall settings and add rules manually."
     );
@@ -1496,67 +1836,44 @@ void MainWindow::onFilesDropped(const QList<QUrl>& urls)
     QString peerName = selected.data(PeerListModel::NameRole).toString();
     QString peerFingerprint = selected.data(PeerListModel::FingerprintRole).toString();
 
-    // Pairing + pinning for outgoing transfers (v0.2.0+)
     QString pinnedFingerprint;
-    if (m_settings) {
-        if (m_settings->isPeerPinned(peerUuid)) {
-            pinnedFingerprint = m_settings->getPinnedFingerprint(peerUuid);
-            if (!peerFingerprint.isEmpty() && !pinnedFingerprint.isEmpty() && peerFingerprint != pinnedFingerprint) {
-                QMessageBox msgBox(this);
-                msgBox.setIcon(QMessageBox::Critical);
-                msgBox.setWindowTitle("Security Warning: Certificate Changed");
-                msgBox.setText("The peer certificate fingerprint does not match the pinned value.\n\n"
-                               "Peer: " + peerName + "\n"
-                               "UUID: " + peerUuid + "\n\n"
-                               "Expected (pinned):\n" + pinnedFingerprint + "\n\n"
-                               "Actual (discovery):\n" + peerFingerprint);
-                QPushButton* rePair = msgBox.addButton("Re-pair", QMessageBox::AcceptRole);
-                msgBox.addButton(QMessageBox::Cancel);
-                msgBox.exec();
 
-                if (msgBox.clickedButton() != rePair) {
-                    return;
-                }
+    // Maximum-security model: require secure pairing (PAIR_REQ/PAIR_RESP) before first transfer.
+    if (!m_settings) {
+        QMessageBox::critical(this, "Internal Error", "Settings manager not initialized.");
+        return;
+    }
 
-                if (peerFingerprint.isEmpty()) {
-                    QMessageBox::warning(this, "Missing Fingerprint",
-                                         "Cannot re-pair because the peer did not advertise a certificate fingerprint yet.\n\n"
-                                         "Ensure the peer is running v0.2.0 or newer, restart it, and wait a few seconds for discovery to refresh.");
-                    return;
-                }
+    if (peerUuid.isEmpty() || peerIp.isEmpty() || peerPort == 0) {
+        QMessageBox::warning(this, "Cannot Send",
+                             "Missing peer identity or network information.");
+        return;
+    }
 
-                m_settings->pinPeerFingerprint(peerUuid, peerFingerprint, peerName);
-                pinnedFingerprint = peerFingerprint;
-            }
-        } else {
-            if (peerFingerprint.isEmpty()) {
-                QMessageBox::warning(this, "Missing Fingerprint",
-                                     "Cannot pair this peer yet because it did not advertise a certificate fingerprint.\n\n"
-                                     "Ensure both devices are running the same v0.2.0 build, restart the peer, and wait a few seconds for discovery to refresh.");
-                return;
-            }
+    if (m_settings->isPeerPinned(peerUuid)) {
+        pinnedFingerprint = m_settings->getPinnedFingerprint(peerUuid);
+    }
 
-            QMessageBox msgBox(this);
-            msgBox.setIcon(QMessageBox::Question);
-            msgBox.setWindowTitle("Pair New Peer");
-            msgBox.setText("This is the first time you are sending a transfer to this peer.\n\n"
-                           "Peer: " + peerName + "\n"
-                           "UUID: " + peerUuid + "\n\n"
-                           "Certificate fingerprint (SHA-256):\n" + peerFingerprint + "\n\n"
-                           "Pair and trust this peer?");
-            QPushButton* pair = msgBox.addButton("Pair", QMessageBox::AcceptRole);
-            msgBox.addButton(QMessageBox::Cancel);
-            msgBox.exec();
-
-            if (msgBox.clickedButton() != pair) {
-                return;
-            }
-
-            m_settings->pinPeerFingerprint(peerUuid, peerFingerprint, peerName);
-            pinnedFingerprint = peerFingerprint;
+    if (pinnedFingerprint.isEmpty()) {
+        if (!pairPeerSecurely(peerUuid, peerName, peerIp, peerPort, pinnedFingerprint)) {
+            return;
         }
-
+    } else {
+        // Best-effort trust metadata update (does not change trust decisions).
         m_settings->updatePeerSeen(peerUuid, peerName);
+
+        // Discovery fingerprint is untrusted. Display-only warning if it conflicts.
+        if (!peerFingerprint.isEmpty() && peerFingerprint != pinnedFingerprint) {
+            const QString pinnedDisplay = QString::fromStdString(
+                ExoSend::FingerprintUtils::formatForDisplay(pinnedFingerprint.toStdString()));
+            const QString actualDisplay = QString::fromStdString(
+                ExoSend::FingerprintUtils::formatForDisplay(peerFingerprint.toStdString()));
+            QMessageBox::warning(this, "Discovery Mismatch",
+                                 "The peer advertised a different certificate fingerprint via discovery.\n\n"
+                                 "Pinned (trusted):\n" + pinnedDisplay + "\n\n"
+                                 "Discovery (untrusted):\n" + actualDisplay + "\n\n"
+                                 "ExoSend will use the pinned fingerprint during TLS and will block mismatches.");
+        }
     }
 
     int queuedCount = 0;
@@ -1610,8 +1927,249 @@ void MainWindow::onFilesDropped(const QList<QUrl>& urls)
 // Security Methods
 // ========================================================================
 
+bool MainWindow::pairPeerSecurely(
+    const QString& peerUuid,
+    const QString& peerName,
+    const QString& peerIp,
+    quint16 peerPort,
+    QString& outPinnedFingerprint)
+{
+    outPinnedFingerprint.clear();
+
+    if (!m_settings) {
+        QMessageBox::critical(this, "Pairing Failed", "Internal error: settings not initialized.");
+        return false;
+    }
+
+    const QString localUuidQ = m_settings->getDeviceUuid();
+    const std::string localUuid = localUuidQ.toStdString();
+    const std::string peerUuidStd = peerUuid.toStdString();
+
+    if (localUuid.empty()) {
+        QMessageBox::critical(this, "Pairing Failed", "Internal error: local device UUID is empty.");
+        return false;
+    }
+
+    if (peerUuidStd.empty() || peerIp.isEmpty() || peerPort == 0) {
+        QMessageBox::warning(this, "Pairing Failed",
+                             "Cannot pair: missing peer identity or network information.");
+        return false;
+    }
+
+    std::array<uint8_t, 16> generated{};
+    std::string genErr;
+    (void)ExoSend::PairingSecret::generate128(generated, genErr);
+    const QString defaultCode = QString::fromStdString(ExoSend::PairingSecret::toBase32Crockford(generated));
+
+    bool ok = false;
+    const QString codeQ = QInputDialog::getText(
+        this,
+        "Secure Pairing Code",
+        "Enter the secure pairing code.\n\n"
+        "For maximum security, this code must be shared out-of-band.\n"
+        "If you do not have one, use the pre-filled code and share it with the peer.\n\n"
+        "Click OK to start pairing now. The peer will be prompted to enter the same code.",
+        QLineEdit::Normal,
+        defaultCode,
+        &ok
+    );
+
+    if (!ok) {
+        return false;
+    }
+
+    std::array<uint8_t, 16> secret{};
+    std::string parseErr;
+    if (!ExoSend::PairingSecret::parse128Base32Crockford(codeQ.toStdString(), secret, parseErr)) {
+        QMessageBox::warning(this, "Invalid Pairing Code",
+                             "The pairing code is invalid.\n\n" + QString::fromStdString(parseErr));
+        return false;
+    }
+
+    // Establish a TLS connection to the peer, then run PAIR_REQ/PAIR_RESP.
+    SOCKET sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (sock == INVALID_SOCKET) {
+        QMessageBox::critical(this, "Pairing Failed",
+                              "socket() failed: " + QString::number(WSAGetLastError()));
+        return false;
+    }
+
+    const uint32_t timeoutMs = ExoSend::CONNECTION_TIMEOUT_MS;
+    if (!ExoSend::setSocketRecvTimeout(sock, timeoutMs)) {
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed", "Failed to set socket timeout.");
+        return false;
+    }
+
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(peerPort);
+    if (::inet_pton(AF_INET, peerIp.toStdString().c_str(), &addr.sin_addr) <= 0) {
+        closesocket(sock);
+        QMessageBox::warning(this, "Pairing Failed", "Invalid peer IP address.");
+        return false;
+    }
+
+    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
+        const int wsaError = WSAGetLastError();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Failed to connect to peer.\n\n"
+                              "Peer: " + peerName + "\n"
+                              "IP: " + peerIp + "\n"
+                              "Port: " + QString::number(peerPort) + "\n\n"
+                              "WSAGetLastError(): " + QString::number(wsaError));
+        return false;
+    }
+
+    std::string tlsErr;
+    ExoSend::TlsSocket tls(sock, ExoSend::TlsRole::CLIENT);
+    if (!tls.handshake(tlsErr)) {
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "TLS handshake failed:\n\n" + QString::fromStdString(tlsErr));
+        return false;
+    }
+
+    ExoSend::TlsTransportStream stream(tls);
+
+    std::array<uint8_t, 32> exporter{};
+    if (!tls.getTlsExporterChannelBinding(exporter, tlsErr)) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Failed to compute TLS channel binding:\n\n" + QString::fromStdString(tlsErr));
+        return false;
+    }
+
+    std::string fpErr;
+    const std::string localFp = tls.getLocalFingerprint(fpErr);
+    const std::string peerFp = tls.getPeerFingerprint(fpErr);
+    if (localFp.empty() || peerFp.empty()) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Failed to obtain certificate fingerprints:\n\n" + QString::fromStdString(fpErr));
+        return false;
+    }
+
+    std::array<uint8_t, 32> confirmKey{};
+    std::string confirmErr;
+    if (!ExoSend::PairingConfirm::deriveConfirmKey(secret, exporter, confirmKey, confirmErr)) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Failed to derive pairing key:\n\n" + QString::fromStdString(confirmErr));
+        return false;
+    }
+
+    std::array<uint8_t, 32> clientTag{};
+    if (!ExoSend::PairingConfirm::computeTag(
+            confirmKey,
+            ExoSend::PairingRole::Client,
+            localUuid,
+            localFp,
+            peerUuidStd,
+            peerFp,
+            clientTag,
+            confirmErr)) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Failed to compute pairing tag:\n\n" + QString::fromStdString(confirmErr));
+        return false;
+    }
+
+    ExoSend::ExoHeader req(ExoSend::PacketType::PAIR_REQ, 0, "");
+    req.setSenderUuid(localUuid);
+    req.setSha256Bytes(clientTag.data());
+
+    std::vector<uint8_t> reqBuf(ExoSend::HEADER_SIZE);
+    (void)req.serializeToBuffer(reqBuf.data());
+
+    std::string ioErr;
+    if (!stream.sendExact(reqBuf.data(), reqBuf.size(), ioErr)) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Failed to send pairing request:\n\n" + QString::fromStdString(ioErr));
+        return false;
+    }
+
+    std::vector<uint8_t> respBuf(ExoSend::HEADER_SIZE);
+    if (!stream.recvExact(respBuf.data(), respBuf.size(), ioErr)) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Failed to receive pairing response:\n\n" + QString::fromStdString(ioErr));
+        return false;
+    }
+
+    ExoSend::ExoHeader resp;
+    if (!resp.deserializeFromBuffer(respBuf.data()) || !resp.isValid()) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed", "Invalid pairing response header.");
+        return false;
+    }
+
+    if (resp.getPacketType() != ExoSend::PacketType::PAIR_RESP) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::warning(this, "Pairing Rejected",
+                             "Peer rejected pairing (no response tag).");
+        return false;
+    }
+
+    if (resp.getSenderUuid() != peerUuidStd) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Peer identity mismatch during pairing.\n\n"
+                              "Expected UUID: " + peerUuid + "\n"
+                              "Actual UUID: " + QString::fromStdString(resp.getSenderUuid()));
+        return false;
+    }
+
+    const auto serverTag = resp.getSha256Bytes();
+    if (!ExoSend::PairingConfirm::verifyTag(
+            confirmKey,
+            ExoSend::PairingRole::Server,
+            peerUuidStd,
+            peerFp,
+            localUuid,
+            localFp,
+            serverTag,
+            confirmErr)) {
+        stream.shutdown();
+        closesocket(sock);
+        QMessageBox::critical(this, "Pairing Failed",
+                              "Pairing confirmation failed:\n\n" + QString::fromStdString(confirmErr));
+        return false;
+    }
+
+    stream.shutdown();
+    closesocket(sock);
+
+    // Pin after cryptographic confirmation succeeded.
+    m_settings->pinPeerFingerprint(peerUuid, QString::fromStdString(peerFp), peerName);
+    m_settings->updatePeerSeen(peerUuid, peerName);
+
+    outPinnedFingerprint = QString::fromStdString(peerFp);
+
+    ExoSend::ThreadSafeLog::log(
+        "TRUST_PIN peer=" + peerUuidStd +
+        " fp=" + outPinnedFingerprint.toStdString().substr(0, 16) + "...");
+
+    return true;
+}
+
 bool MainWindow::handlePendingIncomingTransfer(
     const QString& clientIp,
+    const QString& peerName,
+    const QString& peerUuid,
+    quint16 peerPort,
+    const QString& peerFingerprintSha256Hex,
     const QString& filename,
     qint64 fileSize,
     const QString& pendingSessionId)
@@ -1626,34 +2184,23 @@ bool MainWindow::handlePendingIncomingTransfer(
 
     Q_UNUSED(pendingSessionId);  // Not needed for dialog, but kept for future use
 
-    // Find peer name and UUID from peer list
-    QString peerName = clientIp;  // Default to IP if not found
-    QString peerUuid;
-    quint16 peerPort = 0;
-
-    if (m_peerModel) {
-        for (int i = 0; i < m_peerModel->rowCount(); ++i) {
-            QModelIndex idx = m_peerModel->index(i, 0);
-            QString ip = idx.data(PeerListModel::IpRole).toString();
-            if (ip == clientIp) {
-                peerName = idx.data(PeerListModel::NameRole).toString();
-                peerUuid = idx.data(PeerListModel::UuidRole).toString();
-                peerPort = static_cast<quint16>(idx.data(PeerListModel::PortRole).toUInt());
-                break;
-            }
-        }
-    }
+    const QString effectivePeerName = peerName.isEmpty() ? clientIp : peerName;
 
     // Check auto-accept setting for this peer
     bool autoAcceptEnabled = false;
+    QString pinnedFingerprint;
     if (!peerUuid.isEmpty()) {
         autoAcceptEnabled = m_settings->getAutoAcceptForPeer(peerUuid);
+        pinnedFingerprint = m_settings->getPinnedFingerprint(peerUuid);
     }
 
     QString downloadPath = m_settings->getDownloadPath();
 
     // Skip dialog if auto-accept is enabled
-    if (autoAcceptEnabled) {
+    if (ExoSend::shouldAutoAcceptIncoming(
+            autoAcceptEnabled,
+            pinnedFingerprint.toStdString(),
+            peerFingerprintSha256Hex.toStdString())) {
         if (validateDownloadPath(downloadPath)) {
             m_statusLabel->setText("Auto-accepted: " + filename);
             LogCrash("=== END handlePendingIncomingTransfer (AUTO-ACCEPT) ===");
@@ -1665,7 +2212,7 @@ bool MainWindow::handlePendingIncomingTransfer(
 
     // Show accept/reject dialog with peer info
     IncomingTransferDialog dlg(
-        peerName,
+        effectivePeerName,
         clientIp,
         peerUuid,
         peerPort,
@@ -1682,7 +2229,12 @@ bool MainWindow::handlePendingIncomingTransfer(
         downloadPath = dlg.getDownloadPath();
 
         // Check if "Always accept from this peer" was checked
-        if (dlg.getAlwaysAcceptChecked() && !peerUuid.isEmpty()) {
+        if (dlg.getAlwaysAcceptChecked() &&
+            !peerUuid.isEmpty() &&
+            ExoSend::shouldAutoAcceptIncoming(
+                true,
+                m_settings->getPinnedFingerprint(peerUuid).toStdString(),
+                peerFingerprintSha256Hex.toStdString())) {
             m_settings->setAutoAcceptForPeer(peerUuid, true);
         }
 

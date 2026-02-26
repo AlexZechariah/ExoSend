@@ -65,7 +65,8 @@ void printPeerList(const ExoSend::DiscoveryService& service) {
 
     if (peers.empty()) {
         std::cout << "\n  No peers discovered yet.\n";
-        std::cout << "  (Waiting for UDP beacons on port " << ExoSend::DISCOVERY_PORT_DEFAULT << ")\n";
+        std::cout << "  (Listening on UDP port " << service.getBoundDiscoveryPort()
+                  << " from pool [41000,42100,43210,43500,45100,46000,46100,47100,47500,48100])\n";
     } else {
         // Calculate column widths
         const int nameWidth = 20;

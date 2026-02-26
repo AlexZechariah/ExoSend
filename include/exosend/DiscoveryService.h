@@ -7,6 +7,7 @@
 
 #include "PeerInfo.h"
 #include "config.h"
+#include "BeaconRateLimiter.h"
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -130,6 +131,44 @@ public:
      */
     uint16_t getTcpPort() const { return m_tcpPort; }
 
+    /**
+     * @brief Get the UDP discovery port this instance successfully bound to.
+     * @return Bound port number, or 0 before start().
+     */
+    uint16_t getBoundDiscoveryPort() const { return m_boundDiscoveryPort; }
+
+    /**
+     * @brief Returns true if any discovered peer has the given IP address.
+     *
+     * Used by TransferServer's IP validator callback (wired in MainWindow).
+     * Thread-safe.
+     */
+    bool hasPeerByIp(const std::string& ip) const;
+
+    // -----------------------------------------------------------------------
+    // TEST HELPERS -- only call from test code, never from production paths.
+    // -----------------------------------------------------------------------
+
+    /** Inject a peer directly into the peer table (bypasses socket/network). */
+    void injectPeerForTesting(const std::string& uuid,
+                              const std::string& displayName,
+                              const std::string& ip,
+                              uint16_t tcpPort);
+
+    /** Returns true if the peer table contains the given UUID. Thread-safe. */
+    bool hasPeer(const std::string& uuid) const;
+
+    /**
+     * Simulate receiving a beacon from senderIp by calling parseBeacon()
+     * directly. The rate limiter is NOT checked here -- tests that need to
+     * verify rate-limit behavior call BeaconRateLimiter::shouldProcess() directly.
+     */
+    void simulateIncomingBeacon(const std::string& beaconJson,
+                                const std::string& senderIp);
+
+    /** Call generateBeaconJson() from test code. */
+    std::string generateBeaconJsonForTesting() const;
+
 private:
     /**
      * @brief Transmitter thread function
@@ -222,12 +261,13 @@ private:
     // Identity
     std::string m_displayName;     ///< Human-readable name
     std::string m_uuid;            ///< Unique device identifier
-    uint16_t m_tcpPort;            ///< TCP port for transfers
+    uint16_t m_tcpPort;            ///< TCP port for transfers (advertised in beacons)
     std::string m_certFingerprintSha256Hex; ///< Certificate fingerprint (SHA-256 hex)
 
     // Socket handle (SOCKET from winsock2.h)
     SOCKET m_udpSocket;
     bool m_socketInitialized;      ///< Track if Winsock/socket need cleanup
+    uint16_t m_boundDiscoveryPort; ///< Actual pool port we bound to (0 before start)
 
     // Peer table (thread-safe)
     mutable std::mutex m_peerMutex;  ///< Protects m_peers
@@ -243,6 +283,9 @@ private:
     std::atomic<bool> m_stopRequested; ///< Request threads to stop
     std::condition_variable m_stopCv;  ///< Wakes periodic worker threads on stop
     std::mutex m_stopCvMutex;          ///< Protects m_stopCv waits
+
+    // Security
+    BeaconRateLimiter m_rateLimiter;   ///< Per-IP sliding-window flood protection
 };
 
 }  // namespace ExoSend

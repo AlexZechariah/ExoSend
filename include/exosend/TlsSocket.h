@@ -6,6 +6,7 @@
 #pragma once
 
 #include "config.h"
+#include <array>
 #include <string>
 #include <winsock2.h>
 #include <openssl/ssl.h>
@@ -43,8 +44,8 @@ enum class TlsRole {
  * - Supports both server (SSL_accept) and client (SSL_connect) modes
  *
  * Security Features:
- * - TLS 1.2 minimum (SSLv3, TLSv1.0, TLSv1.1 disabled)
- * - Strong cipher suite (HIGH:!aNULL:!MD5:!3DES)
+ * - TLS 1.3 only (TLS 1.2 and below intentionally disabled)
+ * - Strong cipher suite policy for legacy TLS is still set defensively
  * - ECDHE for forward secrecy
  * - No compression (CRIME attack prevention)
  * - Proper SSL error handling with ERR_get_error()
@@ -234,11 +235,34 @@ public:
     std::string getPeerFingerprint(std::string& errorMsg);
 
     /**
+     * @brief Get local certificate fingerprint (SHA-256) used in this TLS connection.
+     * @param errorMsg Output error message.
+     * @return Hexadecimal fingerprint string (64 characters), or empty on error.
+     */
+    std::string getLocalFingerprint(std::string& errorMsg);
+
+    /**
      * @brief Get peer certificate common name (CN)
      * @param errorMsg Output error message
      * @return Common name from certificate, or empty on error
      */
     std::string getPeerCommonName(std::string& errorMsg);
+
+    /**
+     * @brief Get RFC 9266 tls-exporter channel binding for this connection
+     * @param out Output 32-byte channel binding value
+     * @param errorMsg Output error message on failure
+     * @return true on success
+     *
+     * This uses OpenSSL `SSL_export_keying_material()` with label
+     * `EXPORTER-Channel-Binding` and empty context to produce the standard
+     * `tls-exporter` channel binding (`tls-exporter` in RFC 9266).
+     *
+     * This is designed to be used as a stable channel binding for pairing
+     * confirmation, preventing pre-pairing MITM when combined with an
+     * out-of-band secret.
+     */
+    bool getTlsExporterChannelBinding(std::array<uint8_t, 32>& out, std::string& errorMsg) const;
 
     //=========================================================================
     // Error Handling
@@ -278,7 +302,7 @@ private:
      * @return true if successful
      *
      * Configures SSL_CTX with:
-     * - Minimum TLS version (1.2)
+     * - Minimum TLS version (1.3 only)
      * - Strong cipher list
      * - Security options (no compression, forward secrecy)
      * - ECDHE auto mode
@@ -290,7 +314,7 @@ private:
      * @param errorMsg Output error message
      * @return true if successful
      *
-     * Loads certificate and key from %APPDATA%\ExoSend\certs\
+     * Loads certificate and key from %LOCALAPPDATA%\ExoSend\certs\
      * Verifies private key matches certificate.
      */
     bool loadCertificates(std::string& errorMsg);
@@ -309,8 +333,9 @@ private:
      * @param errorMsg Output error message
      * @return true if successful
      *
-     * For alpha: accepts self-signed certificates
-     * For beta: should implement proper certificate verification
+     * ExoSend accepts self-signed certificates at the TLS verification layer
+     * for peer-to-peer usage without a CA. Peer identity is enforced at the
+     * application layer via secure pairing confirmation plus fingerprint pinning.
      */
     bool configureVerification(std::string& errorMsg);
 
@@ -331,13 +356,18 @@ private:
 //=============================================================================
 
 /**
- * @brief Certificate verification callback
+ * @brief Certificate verification callback (self-signed allowed, v0.3.0+)
  *
- * For alpha: Always returns 1 (accept self-signed certificates)
- * For beta: Should implement proper certificate validation
+ * Accepts self-signed certificate errors (X509_V_ERR_SELF_SIGNED_CERT_IN_CHAIN,
+ * X509_V_ERR_DEPTH_ZERO_SELF_SIGNED_CERT) to support peer-to-peer transfers
+ * without a CA. Rejects all other TLS verification errors.
  *
- * @param preverifyOk Result of X509 certificate verification
- * @param ctx X509 store context
+ * Peer identity is enforced at the application layer via secure pairing
+ * confirmation plus fingerprint pinning in the trust store, not at the
+ * OpenSSL CA validation layer.
+ *
+ * @param preverifyOk Result of X509 certificate verification (1=ok, 0=error)
+ * @param ctx X509 store context containing error code and certificate
  * @return 1 to accept certificate, 0 to reject
  */
 int tlsVerifyCallback(int preverifyOk, X509_STORE_CTX* ctx);

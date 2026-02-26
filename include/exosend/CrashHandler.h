@@ -24,9 +24,24 @@ namespace ExoSend {
  * - Windows structured exceptions
  * - C++ std::terminate()
  *
- * All handlers write crash artifacts to the executable directory before terminating.
+ * Crash artifacts (minidump + log) are written to a user-scoped LocalAppData
+ * directory when crash dumps are enabled.
  */
 void installCrashHandlers();
+
+/**
+ * @brief Enable or disable crash dump writing (privacy control).
+ *
+ * When disabled, ExoSend will not write minidumps or crash logs.
+ *
+ * This is best-effort and must be called as early as possible to be effective.
+ */
+void setCrashDumpsEnabled(bool enabled);
+
+/**
+ * @brief Returns whether crash dumps are currently enabled.
+ */
+bool crashDumpsEnabled();
 
 /**
  * @brief Write crash dump with custom message

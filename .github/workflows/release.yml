@@ -159,7 +159,7 @@ jobs:
     - name: Install Qt6
       uses: jurplel/install-qt-action@v4
       with:
-        version: '6.8.*'
+        version: '6.8.3'
         arch: 'win64_msvc2022_64'
         cache: true
 
@@ -313,6 +313,7 @@ jobs:
 
         Copy-Item (Join-Path $buildDir "ExoSend.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "ExoSendFirewallHelper.exe") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "ExoSendReset.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "*.dll") $stageDir -Force
         Copy-Item (Join-Path $buildDir "platforms") $stageDir -Recurse -Force
         Copy-Item (Join-Path $buildDir "styles") $stageDir -Recurse -Force
@@ -320,6 +321,7 @@ jobs:
         $required = @(
           (Join-Path $stageDir "ExoSend.exe"),
           (Join-Path $stageDir "ExoSendFirewallHelper.exe"),
+          (Join-Path $stageDir "ExoSendReset.exe"),
           (Join-Path $stageDir "Qt6Core.dll"),
           (Join-Path $stageDir "Qt6Gui.dll"),
           (Join-Path $stageDir "Qt6Widgets.dll"),

@@ -361,6 +361,13 @@ TEST_F(ExoHeaderTest, GetPacketTypeReturnsCorrectEnum) {
 
     ExoHeader hashBadHeader(PacketType::HASH_BAD, 0, "");
     EXPECT_EQ(hashBadHeader.getPacketType(), PacketType::HASH_BAD);
+
+    // Pairing protocol extensions (maximum-security hardening)
+    ExoHeader pairReqHeader(PacketType::PAIR_REQ, 0, "");
+    EXPECT_EQ(pairReqHeader.getPacketType(), PacketType::PAIR_REQ);
+
+    ExoHeader pairRespHeader(PacketType::PAIR_RESP, 0, "");
+    EXPECT_EQ(pairRespHeader.getPacketType(), PacketType::PAIR_RESP);
 }
 
 /**
@@ -389,6 +396,12 @@ TEST_F(ExoHeaderTest, GetPacketTypeStringReturnsCorrectStrings) {
 
     header.packetType = static_cast<uint8_t>(PacketType::HASH_BAD);
     EXPECT_EQ(header.getPacketTypeString(), "HASH_BAD");
+
+    header.packetType = static_cast<uint8_t>(PacketType::PAIR_REQ);
+    EXPECT_EQ(header.getPacketTypeString(), "PAIR_REQ");
+
+    header.packetType = static_cast<uint8_t>(PacketType::PAIR_RESP);
+    EXPECT_EQ(header.getPacketTypeString(), "PAIR_RESP");
 }
 
 //=============================================================================

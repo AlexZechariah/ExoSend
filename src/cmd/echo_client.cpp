@@ -2,7 +2,8 @@
  * @file echo_client.cpp
  * @brief Simple TCP echo client for testing
  *
- * This client connects to localhost:9999 and sends a "Hello ExoSend" message.
+ * This client connects to a server at a specified IP and port and sends a
+ * "Hello ExoSend" message. Port must be supplied on the command line.
  */
 
 #include <winsock2.h>
@@ -14,8 +15,8 @@
 
 #pragma comment(lib, "Ws2_32.lib")
 
-// Constants from config
-constexpr uint16_t SERVER_PORT = 9999;
+// Default port: 0 means no default -- pass port as argv[2].
+constexpr uint16_t SERVER_PORT = 0;
 constexpr const char* MESSAGE = "Hello ExoSend";
 
 /**
@@ -70,7 +71,12 @@ int main(int argc, char* argv[]) {
     // Setup the server address structure
     sockaddr_in serverAddr;
     serverAddr.sin_family = AF_INET;
-    serverAddr.sin_addr.s_addr = inet_addr(serverIp);
+    if (InetPtonA(AF_INET, serverIp, &serverAddr.sin_addr) != 1) {
+        std::cerr << "ERROR: Invalid server IP address: " << serverIp << "\n";
+        closesocket(connectSocket);
+        WSACleanup();
+        return 1;
+    }
     serverAddr.sin_port = htons(serverPort);
 
     // Connect to server

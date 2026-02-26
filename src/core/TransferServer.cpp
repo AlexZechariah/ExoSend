@@ -122,6 +122,27 @@ void TransferServer::stop() {
         closesocket(m_listenSocket);
         m_listenSocket = INVALID_SOCKET;
     }
+    m_socketInitialized = false;
+    m_boundTcpPort = 0;
+
+    // Cancel any active client handler threads by shutting down their sockets.
+    // This prevents detached threads from running long after stop() returns
+    // and ensures the TransferServer object is not destroyed while threads
+    // still access its members.
+    {
+        std::vector<SOCKET> socketsToShutdown;
+        {
+            std::lock_guard<std::mutex> lock(m_activeClientsMutex);
+            socketsToShutdown.reserve(m_activeClientSockets.size());
+            for (SOCKET s : m_activeClientSockets) {
+                socketsToShutdown.push_back(s);
+            }
+        }
+
+        for (SOCKET s : socketsToShutdown) {
+            (void)shutdown(s, SD_BOTH);
+        }
+    }
 
     // Cancel all active sessions
     {
@@ -148,6 +169,14 @@ void TransferServer::stop() {
         std::unique_lock<std::shared_mutex> lock(m_sessionsMutex);
         m_sessions.clear();
         m_activeSessionCount.store(0);
+    }
+
+    // Wait for all detached client handler threads to exit.
+    {
+        std::unique_lock<std::mutex> lock(m_activeClientsCvMutex);
+        m_activeClientsCv.wait(lock, [this]() {
+            return m_activeClientThreadCount.load(std::memory_order_acquire) == 0;
+        });
     }
 
     // Mark as not running
@@ -244,12 +273,68 @@ void TransferServer::listenerThreadFunc() {
         inet_ntop(AF_INET, &clientAddr.sin_addr, ipStr, sizeof(ipStr));
         std::string clientIp(ipStr);
 
+        // IP pre-filter: reject connections from IPs not in the discovery peer list.
+        // Defense-in-depth: TLS + ExoSend protocol still authenticate all peers.
+        if (m_ipValidator && !m_ipValidator(clientIp)) {
+            std::cerr << "[TransferServer] Rejected connection from unknown IP: "
+                      << clientIp << " (not in discovery peer list)\n";
+            closesocket(clientSocket);
+            continue;
+        }
+
+        // DoS hardening: per-IP connection rate limiting before spawning threads.
+        if (!m_connectionRateLimiter.shouldAccept(clientIp)) {
+            closesocket(clientSocket);
+            continue;
+        }
+
+        // DoS hardening: cap concurrent client handler threads before spawning.
+        size_t prev = m_activeClientThreadCount.load(std::memory_order_relaxed);
+        while (true) {
+            if (prev >= MAX_CONCURRENT_INCOMING_CLIENT_THREADS) {
+                closesocket(clientSocket);
+                clientSocket = INVALID_SOCKET;
+                break;
+            }
+            if (m_activeClientThreadCount.compare_exchange_weak(
+                    prev,
+                    prev + 1,
+                    std::memory_order_acq_rel,
+                    std::memory_order_relaxed)) {
+                break;
+            }
+        }
+        if (clientSocket == INVALID_SOCKET) {
+            continue;
+        }
+
+        {
+            std::lock_guard<std::mutex> lock(m_activeClientsMutex);
+            m_activeClientSockets.insert(clientSocket);
+        }
+
         // Handle the client in a dedicated thread so the listener is never blocked.
         // Note: Previously handleClient() was called directly on the listener thread,
         // which (a) blocked the listener for the entire transfer duration, and (b) caused
         // ThreadSafeLog to call Qt APIs from a non-Qt thread after the transfer completed,
         // leading to a silent crash with no crash dump.
-        std::thread clientThread(&TransferServer::handleClient, this, clientSocket, clientIp);
+        std::thread clientThread([this, clientSocket, clientIp]() {
+            try {
+                this->handleClient(clientSocket, clientIp);
+            } catch (const std::exception& e) {
+                LogTransferCrash(std::string("=== handleClient: UNCAUGHT EXCEPTION === ") + e.what());
+            } catch (...) {
+                LogTransferCrash("=== handleClient: UNCAUGHT UNKNOWN EXCEPTION ===");
+            }
+
+            {
+                std::lock_guard<std::mutex> lock(m_activeClientsMutex);
+                m_activeClientSockets.erase(clientSocket);
+            }
+
+            m_activeClientThreadCount.fetch_sub(1, std::memory_order_acq_rel);
+            m_activeClientsCv.notify_all();
+        });
         clientThread.detach();
     }
 }
@@ -348,8 +433,72 @@ void TransferServer::handleClient(SOCKET clientSocket, const std::string& client
         return;
     }
 
-    // Validate header
-    if (!offerHeader.isValid() || offerHeader.getPacketType() != PacketType::OFFER) {
+    // Validate header (protocol gate)
+    if (!offerHeader.isValid()) {
+        stream.shutdown();
+        closesocket(clientSocket);
+        return;
+    }
+
+    // Secure pairing handshake (PAIR_REQ / PAIR_RESP)
+    if (offerHeader.getPacketType() == PacketType::PAIR_REQ) {
+        const std::string clientUuid = offerHeader.getSenderUuid();
+
+        std::string localFpErr;
+        const std::string serverFingerprint = tls.getLocalFingerprint(localFpErr);
+
+        std::array<uint8_t, 32> exporter{};
+        std::string exporterErr;
+        const bool exporterOk = tls.getTlsExporterChannelBinding(exporter, exporterErr);
+
+        const auto clientTag = offerHeader.getSha256Bytes();
+
+        std::array<uint8_t, 32> serverTag{};
+        std::string pairingErr;
+        const bool accepted = (m_incomingPairingCallback &&
+                               !m_localDeviceUuid.empty() &&
+                               !clientUuid.empty() &&
+                               !peerFingerprint.empty() &&
+                               !serverFingerprint.empty() &&
+                               exporterOk &&
+                               m_incomingPairingCallback(
+                                   clientIp,
+                                   clientUuid,
+                                   peerFingerprint,
+                                   m_localDeviceUuid,
+                                   serverFingerprint,
+                                   exporter,
+                                   clientTag,
+                                   serverTag,
+                                   pairingErr
+                               ));
+
+        if (!accepted) {
+            uint8_t rejectBuffer[HEADER_SIZE];
+            ExoHeader rejectHeader(PacketType::REJECT, 0, "");
+            (void)rejectHeader.serializeToBuffer(rejectBuffer);
+            std::string rejectError;
+            (void)stream.sendExact(rejectBuffer, HEADER_SIZE, rejectError);
+            stream.shutdown();
+            closesocket(clientSocket);
+            return;
+        }
+
+        uint8_t respBuffer[HEADER_SIZE];
+        ExoHeader respHeader(PacketType::PAIR_RESP, 0, "");
+        respHeader.setSenderUuid(m_localDeviceUuid);
+        respHeader.setSha256Bytes(serverTag.data());
+        (void)respHeader.serializeToBuffer(respBuffer);
+        std::string respError;
+        (void)stream.sendExact(respBuffer, HEADER_SIZE, respError);
+
+        stream.shutdown();
+        closesocket(clientSocket);
+        return;
+    }
+
+    // File transfer path starts with OFFER.
+    if (offerHeader.getPacketType() != PacketType::OFFER) {
         stream.shutdown();
         closesocket(clientSocket);
         return;
@@ -587,37 +736,76 @@ void TransferServer::sendBusyResponse(SOCKET socket) {
 //=============================================================================
 
 bool TransferServer::initializeSocket() {
-    // Create socket
+    // Initialize Winsock. TransferServer now starts before DiscoveryService (v0.3
+    // startup order), so it must own its own WSAStartup rather than relying on
+    // DiscoveryService to have initialized Winsock first.
+    // Ref: https://learn.microsoft.com/en-us/windows/win32/api/winsock/nf-winsock-wsastartup
+    WSADATA wsaData;
+    if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
+        std::cerr << "[TransferServer] WSAStartup failed: " << WSAGetLastError() << "\n";
+        return false;
+    }
+
     m_listenSocket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (m_listenSocket == INVALID_SOCKET) {
+        std::cerr << "[TransferServer] socket() failed: " << WSAGetLastError() << "\n";
+        WSACleanup();
         return false;
     }
-
     m_socketInitialized = true;
 
-    // Set SO_REUSEADDR to allow quick restart
-    int reuseAddr = 1;
-    setsockopt(m_listenSocket, SOL_SOCKET, SO_REUSEADDR,
-               reinterpret_cast<const char*>(&reuseAddr), sizeof(reuseAddr));
+    // SO_EXCLUSIVEADDRUSE: prevents port hijacking and gives authoritative
+    // bind-failure semantics. MUST be set BEFORE bind(). Replaces SO_REUSEADDR
+    // which allows port hijacking on Windows.
+    // Ref: https://learn.microsoft.com/windows/win32/winsock/so-exclusiveaddruse
+    BOOL exclusive = TRUE;
+    if (setsockopt(m_listenSocket, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                   reinterpret_cast<const char*>(&exclusive),
+                   sizeof(exclusive)) == SOCKET_ERROR) {
+        std::cerr << "[TransferServer] SO_EXCLUSIVEADDRUSE failed: "
+                  << WSAGetLastError() << "\n";
+        WSACleanup();
+        cleanupSocket();
+        return false;
+    }
 
-    // Bind to port
+    // Bind to port 0: OS assigns a free ephemeral port (49152-65535 on Windows).
     sockaddr_in serverAddr{};
-    serverAddr.sin_family = AF_INET;
+    serverAddr.sin_family      = AF_INET;
     serverAddr.sin_addr.s_addr = INADDR_ANY;
-    serverAddr.sin_port = htons(m_port);
+    serverAddr.sin_port        = htons(0);
 
-    if (bind(m_listenSocket, reinterpret_cast<const sockaddr*>(&serverAddr),
+    if (bind(m_listenSocket,
+             reinterpret_cast<const sockaddr*>(&serverAddr),
              sizeof(serverAddr)) == SOCKET_ERROR) {
+        std::cerr << "[TransferServer] bind(port=0) failed: " << WSAGetLastError() << "\n";
+        WSACleanup();
         cleanupSocket();
         return false;
     }
 
-    // Start listening
     if (listen(m_listenSocket, SOMAXCONN_VALUE) == SOCKET_ERROR) {
+        std::cerr << "[TransferServer] listen() failed: " << WSAGetLastError() << "\n";
+        WSACleanup();
         cleanupSocket();
         return false;
     }
 
+    // Read back the OS-assigned port via getsockname().
+    // Ref: https://learn.microsoft.com/windows/win32/api/winsock/nf-winsock-getsockname
+    sockaddr_in boundAddr{};
+    int addrLen = sizeof(boundAddr);
+    if (getsockname(m_listenSocket,
+                    reinterpret_cast<sockaddr*>(&boundAddr), &addrLen) == SOCKET_ERROR) {
+        std::cerr << "[TransferServer] getsockname() failed: " << WSAGetLastError() << "\n";
+        WSACleanup();
+        cleanupSocket();
+        return false;
+    }
+
+    m_boundTcpPort = ntohs(boundAddr.sin_port);
+    std::cout << "[TransferServer] Listening on dynamically assigned TCP port "
+              << m_boundTcpPort << "\n";
     return true;
 }
 
@@ -631,6 +819,7 @@ void TransferServer::cleanupSocket() {
         m_listenSocket = INVALID_SOCKET;
     }
     m_socketInitialized = false;
+    m_boundTcpPort = 0;
 }
 
 //=============================================================================

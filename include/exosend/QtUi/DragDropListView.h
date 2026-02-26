@@ -4,20 +4,14 @@
 #include <QListView>
 #include <QDragEnterEvent>
 #include <QDragMoveEvent>
+#include <QDragLeaveEvent>
 #include <QDropEvent>
+#include <QPaintEvent>
 
 /**
  * @class DragDropListView
- * @brief QListView subclass with drag-drop support
- *
- * This class overrides QListView's drag-drop event handlers to:
- * 1. Accept file drag operations
- * 2. Provide proper cursor feedback (not "no drop")
- * 3. Signal when files are dropped
- *
- * Qt event filters CANNOT properly handle drag-drop because they
- * prevent the widget from updating its internal drag state, which
- * is required for cursor updates.
+ * @brief QListView subclass with drag-drop support, empty-state text, and
+ *        a visual drop-zone highlight when files are dragged over the widget.
  */
 class DragDropListView : public QListView
 {
@@ -27,16 +21,17 @@ public:
     explicit DragDropListView(QWidget* parent = nullptr);
 
 signals:
-    /**
-     * @brief Emitted when files are dropped on the list
-     * @param urls List of dropped file URLs
-     */
     void filesDropped(const QList<QUrl>& urls);
 
 protected:
     void dragEnterEvent(QDragEnterEvent* event) override;
     void dragMoveEvent(QDragMoveEvent* event) override;
+    void dragLeaveEvent(QDragLeaveEvent* event) override;
     void dropEvent(QDropEvent* event) override;
+    void paintEvent(QPaintEvent* event) override;
+
+private:
+    bool m_dragActive = false; ///< True while files are being dragged over this widget
 };
 
 #endif // EXOSEND_QTUI_DRAGDROPLISTVIEW_H

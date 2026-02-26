@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(ExoSend VERSION 0.2.0 LANGUAGES CXX)
+project(ExoSend VERSION 0.3.0 LANGUAGES CXX)
 
 # Fail fast on Windows if the configured compiler is not MSVC.
 if(WIN32 AND NOT MSVC)
@@ -15,6 +15,9 @@ set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
+# Optional security hardening flags for MSVC builds.
+option(EXOSEND_SECURITY_HARDENING "Enable MSVC security hardening flags" ON)
+
 # Output directories
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/lib)
@@ -26,7 +29,35 @@ include_directories(${CMAKE_SOURCE_DIR}/include)
 # Find vcpkg packages
 find_package(nlohmann_json CONFIG REQUIRED)
 find_package(OpenSSL REQUIRED)
+
+# Qt6 may optionally look for Vulkan headers (WrapVulkanHeaders). ExoSend does not
+# use Vulkan, and we want a clean configure without "Could NOT find" noise.
+set(CMAKE_DISABLE_FIND_PACKAGE_WrapVulkanHeaders ON)
 find_package(Qt6 REQUIRED COMPONENTS Widgets)
+
+# Enforce a minimum Qt version for security/bugfix patch-level stability.
+# The canonical build guide targets Qt 6.8.3.
+if(Qt6_VERSION VERSION_LESS "6.8.3")
+    message(FATAL_ERROR
+        "Qt6 >= 6.8.3 is required. Detected Qt6_VERSION='${Qt6_VERSION}'. "
+        "Update QT_ROOT_DIR / CI Qt install to a safe patch version."
+    )
+endif()
+
+# MSVC hardening helper (applies /sdl and CFG).
+function(exosend_enable_msvc_hardening target_name)
+    if(MSVC AND EXOSEND_SECURITY_HARDENING)
+        # /FS avoids PDB contention when /Zi is enabled and builds are parallel.
+        target_compile_options(${target_name} PRIVATE /sdl /guard:cf /FS)
+        if(TARGET ${target_name})
+            # Enable Control Flow Guard at link time for executables/DLLs.
+            get_target_property(_type ${target_name} TYPE)
+            if(_type STREQUAL "EXECUTABLE" OR _type STREQUAL "SHARED_LIBRARY" OR _type STREQUAL "MODULE_LIBRARY")
+                target_link_options(${target_name} PRIVATE /guard:cf)
+            endif()
+        endif()
+    endif()
+endfunction()
 
 # ============================================
 # Test Executables
@@ -34,34 +65,68 @@ find_package(Qt6 REQUIRED COMPONENTS Widgets)
 add_executable(echo_server
     src/cmd/echo_server.cpp
 )
+exosend_enable_msvc_hardening(echo_server)
 
 add_executable(echo_client
     src/cmd/echo_client.cpp
+)
+exosend_enable_msvc_hardening(echo_client)
+
+add_library(exosend-devutil STATIC
+    src/core/DevResetArgs.cpp
+)
+exosend_enable_msvc_hardening(exosend-devutil)
+
+target_include_directories(exosend-devutil PUBLIC
+    ${CMAKE_SOURCE_DIR}/include
 )
 
 add_executable(ExoSendFirewallHelper
     src/cmd/firewall_helper.cpp
 )
+exosend_enable_msvc_hardening(ExoSendFirewallHelper)
+
+add_executable(ExoSendReset
+    src/cmd/reset_tool.cpp
+)
+exosend_enable_msvc_hardening(ExoSendReset)
 
 target_link_libraries(echo_server PRIVATE ws2_32)
 target_link_libraries(echo_client PRIVATE ws2_32)
 target_link_libraries(ExoSendFirewallHelper PRIVATE ole32 oleaut32)
+target_link_libraries(ExoSendReset PRIVATE exosend-devutil Shell32)
 
 # ============================================
 # Core Library
 # ============================================
 add_library(exosend-core STATIC
+    src/core/AtomicFile.cpp
+    src/core/AppPaths.cpp
+    src/core/BeaconRateLimiter.cpp
+    src/core/ConnectionRateLimiter.cpp
+    src/core/CrashDumpPaths.cpp
     src/core/DiscoveryService.cpp
     src/core/HashUtils.cpp
     src/core/FileTransfer.cpp
+    src/core/MigrationUtils.cpp
+    src/core/IncomingTransferPolicy.cpp
+    src/core/PairingConfirm.cpp
+    src/core/PairingSecret.cpp
+    src/core/WindowsFilename.cpp
+    src/core/WinSafeFile.cpp
     src/core/TransferSession.cpp
     src/core/TransferServer.cpp
     src/core/TransferQueueManager.cpp
     src/core/TlsSocket.cpp
     src/core/CertificateManager.cpp
     src/core/TrustStore.cpp
+    src/core/TrustStoreDpapi.cpp
     src/core/ThreadSafeLog.cpp
+    src/core/ProtectedBlob.cpp
+    src/core/PairingPromptLimiter.cpp
+    src/core/WindowsAcl.cpp
 )
+exosend_enable_msvc_hardening(exosend-core)
 
 target_include_directories(exosend-core PUBLIC
     ${CMAKE_SOURCE_DIR}/include
@@ -70,11 +135,16 @@ target_include_directories(exosend-core PUBLIC
 target_link_libraries(exosend-core PUBLIC
     Ws2_32
     Bcrypt
+    Crypt32
+    Advapi32
     nlohmann_json::nlohmann_json
     OpenSSL::Crypto
     OpenSSL::SSL
     Qt6::Core
 )
+
+# Dev tooling that depends on core utilities (paths, migration, etc.)
+target_link_libraries(ExoSendReset PRIVATE exosend-core)
 
 # ============================================
 # Test Programs
@@ -83,6 +153,10 @@ add_executable(discovery_test src/cmd/discovery_test.cpp)
 add_executable(file_send_test src/cmd/file_send_test.cpp)
 add_executable(file_receive_test src/cmd/file_receive_test.cpp)
 add_executable(server_test src/cmd/server_test.cpp)
+exosend_enable_msvc_hardening(discovery_test)
+exosend_enable_msvc_hardening(file_send_test)
+exosend_enable_msvc_hardening(file_receive_test)
+exosend_enable_msvc_hardening(server_test)
 
 target_link_libraries(discovery_test PRIVATE exosend-core)
 target_link_libraries(file_send_test PRIVATE exosend-core)
@@ -96,6 +170,7 @@ set(GUI_SOURCES
     src/gui/main.cpp
     src/gui/MainWindow.cpp
     src/gui/DragDropListView.cpp
+    src/gui/PlaceholderListView.cpp
     src/gui/PeerListModel.cpp
     src/gui/PeerListItemDelegate.cpp
     src/gui/TransferListModel.cpp
@@ -110,6 +185,7 @@ set(GUI_SOURCES
 set(GUI_HEADERS
     include/exosend/QtUi/MainWindow.h
     include/exosend/QtUi/DragDropListView.h
+    include/exosend/QtUi/PlaceholderListView.h
     include/exosend/QtUi/PeerListModel.h
     include/exosend/QtUi/PeerListItemDelegate.h
     include/exosend/QtUi/TransferListModel.h
@@ -125,18 +201,27 @@ add_executable(ExoSend
     ${GUI_HEADERS}
     ExoSend.rc
 )
+exosend_enable_msvc_hardening(ExoSend)
 
 # Link against Qt and core library
 target_link_libraries(ExoSend PRIVATE
     Qt6::Widgets
     exosend-core
+    Advapi32
+    ole32
+    uuid
 )
 
 # Add debug symbols for crash dump analysis (Windows MSVC only)
 if(MSVC)
-    # Enable debug symbols in all configurations
-    target_compile_options(ExoSend PRIVATE /Zi)
-    # Generate PDB files for crash dump analysis
+    # Debug symbols are enabled only for Debug/RelWithDebInfo to avoid:
+    # - leaking extra implementation detail in Release binaries
+    # - MSVC PDB contention issues under highly-parallel Release builds
+    target_compile_options(ExoSend PRIVATE
+        $<$<CONFIG:Debug>:/Zi>
+        $<$<CONFIG:RelWithDebInfo>:/Zi>
+    )
+    # Generate PDB files (when enabled) for crash dump analysis
     set_target_properties(ExoSend PROPERTIES
         PDB_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin/Release"
         PDB_NAME "ExoSend"
@@ -147,6 +232,7 @@ endif()
 set(EXOSEND_MOC_HEADERS
     include/exosend/QtUi/CloseWarningDialog.h
     include/exosend/QtUi/DragDropListView.h
+    include/exosend/QtUi/PlaceholderListView.h
     include/exosend/QtUi/IncomingTransferDialog.h
     include/exosend/QtUi/MainWindow.h
     include/exosend/QtUi/PeerListItemDelegate.h
@@ -193,6 +279,7 @@ if(WIN32)
             --release
             --no-translations
             --no-system-d3d-compiler
+            --no-compiler-runtime
             "$<TARGET_FILE:ExoSend>"
         COMMENT "Running windeployqt to deploy Qt runtime..."
     )

@@ -262,10 +262,10 @@ TEST_F(BeaconJsonTest, TcpPortCanBeExtracted) {
 }
 
 /**
- * @test TCP port default value matches config
+ * @test TCP port default is 0 (dynamic: OS assigns an ephemeral port at bind time)
  */
 TEST_F(BeaconJsonTest, TcpPortDefaultMatchesConfig) {
-    EXPECT_EQ(validPort, 9999);
+    EXPECT_EQ(validPort, 0);
 }
 
 /**
