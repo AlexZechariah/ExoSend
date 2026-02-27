@@ -9,46 +9,33 @@
     {
       "name": "windows-msvc-base",
       "hidden": true,
-      "generator": "Visual Studio 17 2022",
-      "architecture": "x64",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
         "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/vcpkg/scripts/buildsystems/vcpkg.cmake",
-        "CMAKE_PREFIX_PATH": "$env{QT_ROOT_DIR}"
-      }
-    },
-    {
-      "name": "windows-debug",
-      "inherits": "windows-msvc-base",
-      "displayName": "Windows Debug",
-      "description": "Debug build for Windows with MSVC",
-      "binaryDir": "${sourceDir}/build/debug",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Debug",
+        "CMAKE_PREFIX_PATH": "$env{QT_ROOT_DIR}",
         "CMAKE_EXPORT_COMPILE_COMMANDS": "ON"
       }
     },
     {
-      "name": "windows-release",
+      "name": "windows",
       "inherits": "windows-msvc-base",
-      "displayName": "Windows Release",
-      "description": "Release build for Windows with MSVC",
-      "binaryDir": "${sourceDir}/build/release",
-      "cacheVariables": {
-        "CMAKE_BUILD_TYPE": "Release",
-        "CMAKE_EXPORT_COMPILE_COMMANDS": "OFF"
-      }
+      "displayName": "Windows (Ninja Multi-Config + MSVC)",
+      "description": "Windows multi-config build using Ninja; supports Debug/Release via --config."
     }
   ],
   "buildPresets": [
     {
       "name": "debug",
-      "configurePreset": "windows-debug",
-      "displayName": "Build Debug"
+      "configurePreset": "windows",
+      "displayName": "Build Debug",
+      "configuration": "Debug"
     },
     {
       "name": "release",
-      "configurePreset": "windows-release",
-      "displayName": "Build Release"
+      "configurePreset": "windows",
+      "displayName": "Build Release",
+      "configuration": "Release"
     }
   ]
 }

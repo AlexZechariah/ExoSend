@@ -49,7 +49,7 @@ static std::string makeUniqueTempDir() {
     const DWORD tid = GetCurrentThreadId();
     const auto dir = base / ("exosend-test-certs-" + std::to_string(pid) + "-" + std::to_string(tid));
     std::filesystem::create_directories(dir);
-    return dir.string();
+    return std::filesystem::canonical(dir).string();
 }
 
 static void setTestCertDirOrFail() {

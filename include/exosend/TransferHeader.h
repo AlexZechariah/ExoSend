@@ -36,7 +36,7 @@ enum class PacketType : uint8_t {
     HASH_OK = 0x06, ///< Receiver confirms hash matched
     HASH_BAD = 0x07, ///< Receiver reports hash mismatch
 
-    // v0.3.x+ pairing protocol extensions (maximum-security hardening)
+    // v0.3.x+ pairing protocol extensions (secure pairing)
     PAIR_REQ = 0x08,  ///< Initiate secure pairing (client -> server)
     PAIR_RESP = 0x09  ///< Pairing confirmation response (server -> client)
 };

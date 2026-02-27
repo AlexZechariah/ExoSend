@@ -273,6 +273,15 @@ private:
     mutable std::mutex m_peerMutex;  ///< Protects m_peers
     std::unordered_map<std::string, PeerInfo> m_peers;  ///< UUID -> PeerInfo
 
+    // Cached broadcast addresses (thread-safe)
+    //
+    // Important: Enumerating adapters via GetAdaptersAddresses() can occasionally block on
+    // some Windows systems, especially during shutdown or network stack transitions. To
+    // keep stop() reliable (e.g. for Factory Reset restart), broadcastGoodbye() uses this
+    // cache rather than calling getBroadcastAddresses() directly.
+    mutable std::mutex m_broadcastCacheMutex;
+    std::vector<std::string> m_cachedBroadcastAddresses;
+
     // Worker threads
     std::thread m_transmitterThread;
     std::thread m_listenerThread;

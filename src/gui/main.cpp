@@ -48,7 +48,7 @@ int main(int argc, char* argv[])
 
     // Set application metadata
     app.setApplicationName("ExoSend");
-    app.setApplicationVersion("0.3.0");
+    app.setApplicationVersion("0.3.1");
     app.setOrganizationName("ExoSend");
     app.setOrganizationDomain("exosend.local");
 

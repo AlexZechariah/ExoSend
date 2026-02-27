@@ -1,12 +1,12 @@
 cmake_minimum_required(VERSION 3.20)
-project(ExoSend VERSION 0.3.0 LANGUAGES CXX)
+project(ExoSend VERSION 0.3.1 LANGUAGES CXX)
 
 # Fail fast on Windows if the configured compiler is not MSVC.
 if(WIN32 AND NOT MSVC)
     message(FATAL_ERROR
         "Windows builds must use MSVC. Detected CMAKE_CXX_COMPILER_ID='${CMAKE_CXX_COMPILER_ID}', "
         "CMAKE_CXX_COMPILER='${CMAKE_CXX_COMPILER}'. "
-        "Configure with 'cmake --preset windows-debug' or 'cmake --preset windows-release'."
+        "Configure with 'cmake --preset windows'."
     )
 endif()
 
@@ -91,6 +91,12 @@ add_executable(ExoSendReset
 )
 exosend_enable_msvc_hardening(ExoSendReset)
 
+add_executable(ExoSendRelaunch
+    src/cmd/relaunch_tool.cpp
+    src/core/RelaunchArgs.cpp
+)
+exosend_enable_msvc_hardening(ExoSendRelaunch)
+
 target_link_libraries(echo_server PRIVATE ws2_32)
 target_link_libraries(echo_client PRIVATE ws2_32)
 target_link_libraries(ExoSendFirewallHelper PRIVATE ole32 oleaut32)
@@ -111,6 +117,8 @@ add_library(exosend-core STATIC
     src/core/MigrationUtils.cpp
     src/core/IncomingTransferPolicy.cpp
     src/core/PairingConfirm.cpp
+    src/core/PairingPhrase.cpp
+    src/core/PairingPhraseExtract.cpp
     src/core/PairingSecret.cpp
     src/core/WindowsFilename.cpp
     src/core/WinSafeFile.cpp
@@ -178,6 +186,8 @@ set(GUI_SOURCES
     src/gui/TrayIcon.cpp
     src/gui/SettingsDialog.cpp
     src/gui/IncomingTransferDialog.cpp
+    src/gui/SecurePairingIncomingDialog.cpp
+    src/gui/SecurePairingOutgoingDialog.cpp
     src/gui/CloseWarningDialog.cpp
     src/gui/CrashHandler.cpp
 )
@@ -193,6 +203,8 @@ set(GUI_HEADERS
     include/exosend/QtUi/TrayIcon.h
     include/exosend/QtUi/SettingsDialog.h
     include/exosend/QtUi/IncomingTransferDialog.h
+    include/exosend/QtUi/SecurePairingIncomingDialog.h
+    include/exosend/QtUi/SecurePairingOutgoingDialog.h
     include/exosend/QtUi/CloseWarningDialog.h
 )
 
@@ -234,6 +246,8 @@ set(EXOSEND_MOC_HEADERS
     include/exosend/QtUi/DragDropListView.h
     include/exosend/QtUi/PlaceholderListView.h
     include/exosend/QtUi/IncomingTransferDialog.h
+    include/exosend/QtUi/SecurePairingIncomingDialog.h
+    include/exosend/QtUi/SecurePairingOutgoingDialog.h
     include/exosend/QtUi/MainWindow.h
     include/exosend/QtUi/PeerListItemDelegate.h
     include/exosend/QtUi/PeerListModel.h

@@ -267,6 +267,14 @@ private:
     void stopServices();
 
     /**
+     * @brief Perform a factory reset (settings + trust) and restart ExoSend.
+     *
+     * This clears trusted peers, per-peer auto-accept preferences, and resets
+     * general settings to defaults (while keeping UUID and TLS cert identity).
+     */
+    void performFactoryReset(bool removeFirewallRules);
+
+    /**
      * @brief Check for firewall issues
      * @return true if no issues, false if firewall may be blocking
      */
@@ -305,10 +313,10 @@ private:
     );
 
     /**
-     * @brief Perform maximum-security pairing with a peer (PAIR_REQ/PAIR_RESP over TLS).
+     * @brief Perform secure pairing with a peer (PAIR_REQ/PAIR_RESP over TLS).
      *
-     * This is used to eliminate TOFU-only pairing by requiring an out-of-band
-     * high-entropy pairing code bound to the TLS channel binding (tls-exporter).
+     * Pairing uses an out-of-band shared secret represented as a 12-word phrase,
+     * bound to the TLS channel binding (RFC 9266 tls-exporter) for confirmation.
      *
      * On success, this pins the peer certificate fingerprint in SettingsManager.
      *

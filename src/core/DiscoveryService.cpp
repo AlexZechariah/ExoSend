@@ -57,6 +57,7 @@ DiscoveryService::DiscoveryService()
     : m_displayName("Unknown")
     , m_uuid(generateUuid())
     , m_tcpPort(TCP_PORT_DEFAULT)
+    , m_cachedBroadcastAddresses({"255.255.255.255"})
     , m_udpSocket(INVALID_SOCKET)
     , m_socketInitialized(false)
     , m_boundDiscoveryPort(0)
@@ -77,9 +78,12 @@ DiscoveryService::DiscoveryService(DiscoveryService&& other) noexcept
     : m_displayName(std::move(other.m_displayName))
     , m_uuid(std::move(other.m_uuid))
     , m_tcpPort(other.m_tcpPort)
+    , m_certFingerprintSha256Hex(std::move(other.m_certFingerprintSha256Hex))
     , m_udpSocket(other.m_udpSocket)
     , m_socketInitialized(other.m_socketInitialized)
+    , m_boundDiscoveryPort(other.m_boundDiscoveryPort)
     , m_peers(std::move(other.m_peers))
+    , m_cachedBroadcastAddresses(std::move(other.m_cachedBroadcastAddresses))
     , m_transmitterThread(std::move(other.m_transmitterThread))
     , m_listenerThread(std::move(other.m_listenerThread))
     , m_gcThread(std::move(other.m_gcThread))
@@ -88,6 +92,7 @@ DiscoveryService::DiscoveryService(DiscoveryService&& other) noexcept
     // Mark moved-from object as invalid
     other.m_udpSocket = INVALID_SOCKET;
     other.m_socketInitialized = false;
+    other.m_boundDiscoveryPort = 0;
     other.m_running = false;
     other.m_stopRequested = true;
 }
@@ -101,9 +106,15 @@ DiscoveryService& DiscoveryService::operator=(DiscoveryService&& other) noexcept
         m_displayName = std::move(other.m_displayName);
         m_uuid = std::move(other.m_uuid);
         m_tcpPort = other.m_tcpPort;
+        m_certFingerprintSha256Hex = std::move(other.m_certFingerprintSha256Hex);
         m_udpSocket = other.m_udpSocket;
         m_socketInitialized = other.m_socketInitialized;
+        m_boundDiscoveryPort = other.m_boundDiscoveryPort;
         m_peers = std::move(other.m_peers);
+        {
+            std::lock_guard<std::mutex> lock(m_broadcastCacheMutex);
+            m_cachedBroadcastAddresses = std::move(other.m_cachedBroadcastAddresses);
+        }
         m_transmitterThread = std::move(other.m_transmitterThread);
         m_listenerThread = std::move(other.m_listenerThread);
         m_gcThread = std::move(other.m_gcThread);
@@ -113,6 +124,7 @@ DiscoveryService& DiscoveryService::operator=(DiscoveryService&& other) noexcept
         // Mark moved-from object as invalid
         other.m_udpSocket = INVALID_SOCKET;
         other.m_socketInitialized = false;
+        other.m_boundDiscoveryPort = 0;
         other.m_running = false;
         other.m_stopRequested = true;
     }
@@ -158,21 +170,26 @@ void DiscoveryService::stop() {
 
     LogDiscovery("=== DiscoveryService::stop START ===");
 
-    // NEW: Broadcast goodbye beacon BEFORE stopping threads
-    // This ensures peers are notified immediately
-    if (m_udpSocket != INVALID_SOCKET) {
-        broadcastGoodbye();
-    }
+    LogDiscovery("DiscoveryService::stop: request stop");
 
     // Signal threads to stop
     m_stopRequested = true;
     m_running = false;
     m_stopCv.notify_all();
 
+    // Best-effort: Broadcast goodbye beacon without enumerating adapters.
+    // (broadcastGoodbye() uses cached addresses to avoid GetAdaptersAddresses() stalls.)
+    if (m_udpSocket != INVALID_SOCKET) {
+        LogDiscovery("DiscoveryService::stop: goodbye start");
+        broadcastGoodbye();
+        LogDiscovery("DiscoveryService::stop: goodbye end");
+    }
+
     // Note: Shutdown socket BEFORE joining threads
     // This causes recvfrom() to return with error, unblocking listener thread
     // which is blocked in a blocking recvfrom() call
     if (m_udpSocket != INVALID_SOCKET) {
+        LogDiscovery("DiscoveryService::stop: shutdown socket");
         shutdown(m_udpSocket, SD_BOTH);      // Unblock recvfrom
         closesocket(m_udpSocket);           // Close socket
         m_udpSocket = INVALID_SOCKET;       // Mark as closed
@@ -180,16 +197,20 @@ void DiscoveryService::stop() {
 
     // Now joins will complete quickly (listener was blocked in recvfrom)
     if (m_transmitterThread.joinable()) {
+        LogDiscovery("DiscoveryService::stop: join transmitter");
         m_transmitterThread.join();
     }
     if (m_listenerThread.joinable()) {
+        LogDiscovery("DiscoveryService::stop: join listener");
         m_listenerThread.join();
     }
     if (m_gcThread.joinable()) {
+        LogDiscovery("DiscoveryService::stop: join gc");
         m_gcThread.join();
     }
 
     // Cleanup is now safe (socket may already be closed)
+    LogDiscovery("DiscoveryService::stop: cleanup socket");
     cleanupSocket();
     LogDiscovery("=== DiscoveryService::stop END ===");
 }
@@ -256,6 +277,10 @@ void DiscoveryService::transmitterThreadFunc() {
 
     // Get initial broadcast addresses.
     std::vector<std::string> broadcastAddresses = getBroadcastAddresses();
+    {
+        std::lock_guard<std::mutex> lock(m_broadcastCacheMutex);
+        m_cachedBroadcastAddresses = broadcastAddresses;
+    }
     auto lastRefresh    = std::chrono::steady_clock::now();
     int  burstRemaining = DISCOVERY_STARTUP_BURST_COUNT;
 
@@ -302,6 +327,10 @@ void DiscoveryService::transmitterThreadFunc() {
         if (std::chrono::duration_cast<std::chrono::seconds>(
                 now - lastRefresh).count() >= BROADCAST_REFRESH_INTERVAL_S) {
             broadcastAddresses = getBroadcastAddresses();
+            {
+                std::lock_guard<std::mutex> lock(m_broadcastCacheMutex);
+                m_cachedBroadcastAddresses = broadcastAddresses;
+            }
             lastRefresh        = now;
         }
 
@@ -822,7 +851,19 @@ void DiscoveryService::cleanupSocket() {
 //=============================================================================
 
 void DiscoveryService::broadcastGoodbye() {
-    std::vector<std::string> broadcastAddresses = getBroadcastAddresses();
+    std::vector<std::string> broadcastAddresses;
+    {
+        std::lock_guard<std::mutex> lock(m_broadcastCacheMutex);
+        broadcastAddresses = m_cachedBroadcastAddresses;
+    }
+
+    // Always include limited broadcast as a fallback.
+    broadcastAddresses.push_back("255.255.255.255");
+
+    // Deduplicate (cache may already include limited broadcast).
+    std::sort(broadcastAddresses.begin(), broadcastAddresses.end());
+    broadcastAddresses.erase(std::unique(broadcastAddresses.begin(), broadcastAddresses.end()),
+                             broadcastAddresses.end());
 
     json beacon;
     beacon["protocol_id"]    = PROTOCOL_ID;

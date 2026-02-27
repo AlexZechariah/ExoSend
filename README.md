@@ -1,11 +1,11 @@
 # ExoSend
 
-> Decentralized local file transfer system for Windows 10
+> Local peer-to-peer file transfers for Windows 10
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010-blue.svg)](https://www.microsoft.com/windows)
 
-ExoSend enables seamless peer-to-peer file transfers over local WiFi networks without requiring internet connectivity or cloud services. Features automatic peer discovery, TLS 1.3 encryption, SHA-256 verification, secure pairing, and high-performance transfer.
+ExoSend provides peer-to-peer file transfers over local WiFi networks without requiring internet connectivity or cloud services. It includes automatic peer discovery, TLS 1.3 encryption, SHA-256 verification, secure pairing, and transfer progress tracking.
 
 ---
 
@@ -24,7 +24,7 @@ ExoSend enables seamless peer-to-peer file transfers over local WiFi networks wi
 
 ## Features
 
-- **Zero-Configuration Discovery** - Automatic peer detection via UDP broadcast
+- **Automatic Discovery** - Peer detection via UDP broadcast
 - **Direct P2P Transfers** - No cloud services or internet required
 - **TLS 1.3 Encryption** - Secure file transfers with self-signed certificates
 - **SHA-256 Verification** - Integrity checking for all transferred files
@@ -65,7 +65,7 @@ ExoSend enables seamless peer-to-peer file transfers over local WiFi networks wi
 
 ## Pairing and Trust
 
-ExoSend requires secure pairing before transfers. Pairing pins the peer's TLS certificate fingerprint in a DPAPI-protected trust store, but only after the pairing code is verified.
+ExoSend requires secure pairing before transfers. Pairing pins the peer's TLS certificate fingerprint in a DPAPI-protected trust store, but only after the pairing phrase is verified.
 
 ### First-time pairing (secure, fail-closed)
 
@@ -73,18 +73,28 @@ When you transfer to a new peer:
 
 1. ExoSend establishes a mutual TLS 1.3 connection using self-signed certificates.
 2. ExoSend performs pairing confirmation using:
-   - A **high-entropy pairing code** entered out-of-band (26 characters, Crockford Base32 representing 128 bits of entropy).
+   - A **high-entropy pairing phrase** entered out-of-band (12 RFC 1751 words representing 128 bits of entropy).
+     - Share format: one hyphen-separated line (`word1-word2-...-word12`) to avoid whitespace/newline issues in messaging apps.
    - A TLS channel binding derived from the handshake (RFC 9266 `tls-exporter`, `EXPORTER-Channel-Binding`).
 3. Only if the confirmation succeeds does ExoSend pin the peer certificate fingerprint.
 
-This design prevents pre-pairing MITM unless the attacker also learns the pairing code.
+This design prevents pre-pairing MITM unless the attacker also learns the pairing phrase.
 
 ### Subsequent connections
 
 - If the pinned fingerprint matches, transfers proceed.
-- If a pinned peer's fingerprint changes, ExoSend blocks the transfer and requires re-pairing with a new pairing code.
+- If a pinned peer's fingerprint changes, ExoSend blocks the transfer and requires re-pairing with a new pairing phrase.
 
 Pairing and settings are stored per-machine in the user profile (typically under `%LOCALAPPDATA%`), and are not transferred when you copy the app folder to another PC or VM.
+
+### Factory Reset
+
+In the GUI, **Settings → Factory Reset…** resets ExoSend back to a “first use” trust state by:
+- Resetting preferences to defaults
+- Forgetting all paired peers (clears the trust store)
+- Clearing per-peer auto-accept preferences
+
+Factory Reset does **not** rotate TLS certificates and does **not** change the device UUID. To remove all user data (including TLS identity and UUID) use the uninstaller’s “Remove user data” option.
 
 ### Firewall Configuration
 
@@ -172,4 +182,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ---
 
-**ExoSend** - Fast, secure, local file transfers for Windows 10.
+**ExoSend** - Local file transfers for Windows 10.

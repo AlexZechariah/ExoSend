@@ -2,7 +2,7 @@
  * @file PairingConfirm.h
  * @brief Pairing confirmation helpers (HKDF + HMAC) bound to a TLS channel binding.
  *
- * This is used for maximum-security pairing. After the TLS handshake completes,
+ * This is used for secure pairing. After the TLS handshake completes,
  * both sides compute the RFC 9266 tls-exporter channel binding and use it as
  * a salt in HKDF, with an out-of-band secret as input key material.
  *

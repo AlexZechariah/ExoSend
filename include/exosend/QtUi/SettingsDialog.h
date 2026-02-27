@@ -67,6 +67,21 @@ public:
      */
     ~SettingsDialog() override = default;
 
+    /**
+     * @brief Whether the user requested a Factory Reset from this dialog.
+     *
+     * If true, the caller should execute the reset outside the dialog (typically
+     * in MainWindow) and restart ExoSend.
+     */
+    bool factoryResetRequested() const { return m_factoryResetRequested; }
+
+    /**
+     * @brief Whether Factory Reset should also attempt to remove Windows Firewall rules.
+     *
+     * This requires Administrator approval (UAC) and is best-effort.
+     */
+    bool factoryResetRemoveFirewall() const { return m_factoryResetRemoveFirewall; }
+
 private slots:
     /**
      * @brief Browse for download directory
@@ -100,6 +115,11 @@ private slots:
      * and closes dialog with Rejected result.
      */
     void onReject();
+
+    /**
+     * @brief Request a factory reset (settings + trust) and restart ExoSend.
+     */
+    void onFactoryReset();
 
     // ========================================================================
     // Trusted Peers tab slots (v0.3.0)
@@ -162,6 +182,9 @@ private:
 private:
     SettingsManager* m_settings;      ///< Settings manager (not owned)
 
+    bool m_factoryResetRequested{false};
+    bool m_factoryResetRemoveFirewall{false};
+
     // ========================================================================
     // General tab widgets
     // ========================================================================
@@ -175,6 +198,7 @@ private:
     QCheckBox* m_enableCrashDumpsCheckBox;  ///< Checkbox for crash dump writing (privacy)
     QSlider* m_peerTimeoutSlider;     ///< Peer timeout slider (unused, kept for compat)
     QLabel* m_peerTimeoutValueLabel;  ///< Label showing current timeout value (unused)
+    QPushButton* m_factoryResetButton{nullptr}; ///< Button for factory reset UX
 
     // ========================================================================
     // Trusted Peers tab widgets (v0.3.0)

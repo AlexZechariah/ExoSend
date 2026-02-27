@@ -446,6 +446,17 @@ constexpr size_t HASH_SIZE = 32;  // SHA-256 produces 32 bytes
 constexpr uint32_t CONNECTION_TIMEOUT_MS = 30000;  // 30 seconds
 
 /**
+ * @brief Secure pairing timeout
+ *
+ * Secure pairing includes human entry of an out-of-band phrase. This timeout
+ * must be long enough for manual entry without causing spurious failures.
+ *
+ * Note: This timeout is specific to pairing. File transfers keep a shorter
+ * connection timeout.
+ */
+constexpr uint32_t PAIRING_TIMEOUT_MS = 5u * 60u * 1000u;  // 5 minutes
+
+/**
  * @brief Delay between send retries
  *
  * When a partial send occurs, wait 100ms before retrying.
@@ -560,7 +571,7 @@ constexpr bool TLS_ENABLED = true;                      // Enable/disable TLS
  * @brief Minimum TLS version
  *
  * The minimum accepted TLS version is "TLSv1.3".
- * TLS 1.2 and below are intentionally rejected for maximum security and simpler
+ * TLS 1.2 and below are intentionally rejected for security and to reduce the
  * protocol surface.
  */
 constexpr const char* TLS_VERSION = "TLSv1.3";          // Minimum TLS version (docs)

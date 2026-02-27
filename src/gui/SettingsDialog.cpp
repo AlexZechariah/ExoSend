@@ -106,6 +106,42 @@ void SettingsDialog::onReject()
     reject();
 }
 
+void SettingsDialog::onFactoryReset()
+{
+    QMessageBox dlg(this);
+    dlg.setWindowTitle("Factory Reset");
+    dlg.setIcon(QMessageBox::Warning);
+    dlg.setText("Reset ExoSend settings and forget all paired peers?");
+    dlg.setInformativeText(
+        "This will:\n"
+        "- Reset preferences to defaults\n"
+        "- Forget all paired peers (clears trusted peers)\n"
+        "- Clear per-peer auto-accept preferences\n"
+        "- Restart ExoSend\n\n"
+        "This cannot be undone."
+    );
+
+    QCheckBox* firewallCheck = new QCheckBox("Also remove Windows Firewall rules (Admin)", &dlg);
+    firewallCheck->setChecked(true);
+    firewallCheck->setToolTip(
+        "Best-effort: this may prompt for Administrator approval (UAC).\n"
+        "If denied, the reset will still complete but firewall rules may remain.");
+    dlg.setCheckBox(firewallCheck);
+
+    dlg.setStandardButtons(QMessageBox::Yes | QMessageBox::Cancel);
+    dlg.setDefaultButton(QMessageBox::Cancel);
+
+    if (dlg.exec() != QMessageBox::Yes) {
+        return;
+    }
+
+    m_factoryResetRequested = true;
+    m_factoryResetRemoveFirewall = firewallCheck->isChecked();
+
+    // Close the settings dialog. The caller (MainWindow) will perform reset + restart.
+    reject();
+}
+
 // ========================================================================
 // Private Slots: Trusted Peers tab (v0.3.0)
 // ========================================================================
@@ -238,6 +274,10 @@ void SettingsDialog::setupUi()
             this, &SettingsDialog::onSave);
     connect(m_buttonBox->button(QDialogButtonBox::Cancel), &QPushButton::clicked,
             this, &SettingsDialog::onReject);
+    if (m_factoryResetButton) {
+        connect(m_factoryResetButton, &QPushButton::clicked,
+                this, &SettingsDialog::onFactoryReset);
+    }
     connect(m_downloadPathEdit, &QLineEdit::textChanged,
             this, &SettingsDialog::validatePath);
 }
@@ -303,6 +343,15 @@ QWidget* SettingsDialog::buildGeneralTab()
     m_peerTimeoutSlider->hide();
     m_peerTimeoutValueLabel = new QLabel("10s (fixed)");
     m_peerTimeoutValueLabel->hide();
+
+    formLayout->addItem(new QSpacerItem(0, 14, QSizePolicy::Minimum, QSizePolicy::Fixed));
+
+    // Factory reset (settings + trust + restart).
+    m_factoryResetButton = new QPushButton("Factory Reset...");
+    m_factoryResetButton->setToolTip(
+        "Reset settings to defaults, forget all paired peers, and restart ExoSend.");
+    m_factoryResetButton->setStyleSheet("color: red;");
+    formLayout->addRow("", m_factoryResetButton);
 
     // Error label
     m_errorLabel = new QLabel();

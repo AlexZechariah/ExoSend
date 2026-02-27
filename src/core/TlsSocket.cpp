@@ -14,6 +14,7 @@
 #include <cstring>
 #include <iostream>
 #include <algorithm>
+#include <windows.h>
 
 // Undefine Windows macros that conflict with std::min/max
 #ifdef min
@@ -31,6 +32,7 @@ namespace ExoSend {
 
 namespace {
     bool g_openSslInitialized = false;
+    static std::string formatSslFailureDetails(int sslErrorCode, int wsaErrorCode);
 }
 
 void initOpenSsl() {
@@ -148,7 +150,7 @@ bool TlsSocket::createContext(std::string& errorMsg) {
         return false;
     }
 
-    // Maximum security: TLS 1.3 only (no legacy protocol negotiation).
+    // TLS 1.3 only (no legacy protocol negotiation).
     if (SSL_CTX_set_min_proto_version(m_ctx, TLS1_3_VERSION) != 1) {
         errorMsg = "Failed to set minimum TLS version: " + getLastError();
         return false;
@@ -276,8 +278,10 @@ bool TlsSocket::handshake(std::string& errorMsg) {
     }
 
     if (result != 1) {
+        const int wsaError = WSAGetLastError();
         int err = SSL_get_error(m_ssl, result);
-        errorMsg = "TLS handshake failed (" + getErrorDescription(err) + "): " + getLastError();
+        errorMsg = "TLS handshake failed (" + getErrorDescription(err) + "): " +
+                   formatSslFailureDetails(err, wsaError);
         return false;
     }
 
@@ -315,8 +319,10 @@ bool TlsSocket::send(const uint8_t* data, size_t size, std::string& errorMsg) {
         int sent = SSL_write(m_ssl, data + offset, static_cast<int>(chunkSize));
 
         if (sent <= 0) {
+            const int wsaError = WSAGetLastError();
             int err = SSL_get_error(m_ssl, sent);
-            errorMsg = "TLS write failed (" + getErrorDescription(err) + "): " + getLastError();
+            errorMsg = "TLS write failed (" + getErrorDescription(err) + "): " +
+                       formatSslFailureDetails(err, wsaError);
             return false;
         }
 
@@ -339,6 +345,7 @@ size_t TlsSocket::recv(uint8_t* buffer, size_t size, std::string& errorMsg) {
     int received = SSL_read(m_ssl, buffer, static_cast<int>(size));
 
     if (received <= 0) {
+        const int wsaError = WSAGetLastError();
         int err = SSL_get_error(m_ssl, received);
 
         // Connection closed cleanly
@@ -346,7 +353,8 @@ size_t TlsSocket::recv(uint8_t* buffer, size_t size, std::string& errorMsg) {
             return 0;
         }
 
-        errorMsg = "TLS read failed (" + getErrorDescription(err) + "): " + getLastError();
+        errorMsg = "TLS read failed (" + getErrorDescription(err) + "): " +
+                   formatSslFailureDetails(err, wsaError);
         return 0;
     }
 
@@ -366,11 +374,13 @@ bool TlsSocket::sendExact(const uint8_t* data, size_t size, std::string& errorMs
         int sent = SSL_write(m_ssl, data + totalSent, static_cast<int>(chunkSize));
 
         if (sent <= 0) {
+            const int wsaError = WSAGetLastError();
             int err = SSL_get_error(m_ssl, sent);
             if (err == SSL_ERROR_WANT_WRITE) {
                 continue;  // Retry
             }
-            errorMsg = "TLS send failed (" + getErrorDescription(err) + "): " + getLastError();
+            errorMsg = "TLS send failed (" + getErrorDescription(err) + "): " +
+                       formatSslFailureDetails(err, wsaError);
             return false;
         }
 
@@ -391,6 +401,7 @@ bool TlsSocket::recvExact(uint8_t* buffer, size_t size, std::string& errorMsg) {
                                 static_cast<int>(size - totalReceived));
 
         if (received <= 0) {
+            const int wsaError = WSAGetLastError();
             int err = SSL_get_error(m_ssl, received);
 
             if (err == SSL_ERROR_ZERO_RETURN) {
@@ -402,7 +413,8 @@ bool TlsSocket::recvExact(uint8_t* buffer, size_t size, std::string& errorMsg) {
                 continue;  // Retry
             }
 
-            errorMsg = "TLS recv failed (" + getErrorDescription(err) + "): " + getLastError();
+            errorMsg = "TLS recv failed (" + getErrorDescription(err) + "): " +
+                       formatSslFailureDetails(err, wsaError);
             return false;
         }
 
@@ -582,6 +594,68 @@ std::string TlsSocket::getLastError() {
     ERR_error_string_n(err, buf, sizeof(buf));
     return std::string(buf);
 }
+
+namespace {
+
+static std::string trimRight(std::string s) {
+    while (!s.empty()) {
+        const unsigned char c = static_cast<unsigned char>(s.back());
+        if (c == ' ' || c == '\t' || c == '\r' || c == '\n') {
+            s.pop_back();
+            continue;
+        }
+        break;
+    }
+    return s;
+}
+
+static std::string win32ErrorToString(DWORD code) {
+    if (code == 0) return {};
+
+    LPSTR buf = nullptr;
+    const DWORD flags = FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM |
+                        FORMAT_MESSAGE_IGNORE_INSERTS;
+    const DWORD lang = MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT);
+    const DWORD n = FormatMessageA(flags, nullptr, code, lang, reinterpret_cast<LPSTR>(&buf), 0, nullptr);
+
+    std::string msg;
+    if (n > 0 && buf) {
+        msg.assign(buf, buf + n);
+        msg = trimRight(std::move(msg));
+    }
+    if (buf) {
+        LocalFree(buf);
+    }
+
+    if (msg.empty()) {
+        return "Win32 error " + std::to_string(static_cast<unsigned long>(code));
+    }
+    return msg;
+}
+
+static std::string formatSslFailureDetails(int sslErrorCode, int wsaErrorCode) {
+    // Prefer OpenSSL's error queue when present.
+    const unsigned long opensslErr = ERR_get_error();
+    if (opensslErr != 0) {
+        char buf[256];
+        ERR_error_string_n(opensslErr, buf, sizeof(buf));
+        return std::string(buf);
+    }
+
+    // SSL_ERROR_SYSCALL often indicates an underlying socket error (or EOF)
+    // and may not populate the OpenSSL error queue.
+    if (sslErrorCode == SSL_ERROR_SYSCALL) {
+        if (wsaErrorCode != 0) {
+            const std::string msg = win32ErrorToString(static_cast<DWORD>(wsaErrorCode));
+            return "WSAGetLastError()=" + std::to_string(wsaErrorCode) + " (" + msg + ")";
+        }
+        return "Socket I/O failed without a Windows socket error (peer may have closed the connection)";
+    }
+
+    return "Unknown error";
+}
+
+}  // namespace
 
 std::string TlsSocket::getErrorDescription(int sslErrorCode) {
     switch (sslErrorCode) {

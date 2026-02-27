@@ -11,12 +11,15 @@
 #include "exosend/QtUi/SettingsDialog.h"
 #include "exosend/QtUi/CloseWarningDialog.h"
 #include "exosend/QtUi/IncomingTransferDialog.h"
+#include "exosend/QtUi/SecurePairingIncomingDialog.h"
+#include "exosend/QtUi/SecurePairingOutgoingDialog.h"
 #include "exosend/QtUi/PeerListModel.h"
 #include "exosend/QtUi/PeerListItemDelegate.h"
 #include "exosend/QtUi/TransferListModel.h"
 #include "exosend/QtUi/TrayIcon.h"
 #include "exosend/QtUi/PlaceholderListView.h"
 #include "exosend/config.h"
+#include "exosend/ErrorCodes.h"
 #include "exosend/PeerInfo.h"
 #include "exosend/DiscoveryService.h"
 #include "exosend/FileTransfer.h"
@@ -27,6 +30,8 @@
 #include "exosend/IncomingTransferPolicy.h"
 #include "exosend/PairingConfirm.h"
 #include "exosend/PairingSecret.h"
+#include "exosend/PairingPhrase.h"
+#include "exosend/PairingPhraseExtract.h"
 #include "exosend/TlsSocket.h"
 #include "exosend/TransportStream.h"
 #include "exosend/Debug.h"
@@ -54,7 +59,6 @@
 #include <QPointer>
 #include <QProcess>
 #include <QDebug>
-#include <QInputDialog>
 #include <iostream>
 #include <thread>  // For std::this_thread::get_id()
 #include <condition_variable>  // For thread synchronization without Qt BlockingQueuedConnection
@@ -299,7 +303,14 @@ void MainWindow::mousePressEvent(QMouseEvent* event)
 void MainWindow::onOpenSettings()
 {
     SettingsDialog dlg(m_settings.get(), this);
-    if (dlg.exec() == QDialog::Accepted) {
+    dlg.exec();
+
+    if (dlg.factoryResetRequested()) {
+        performFactoryReset(dlg.factoryResetRemoveFirewall());
+        return;
+    }
+
+    if (dlg.result() == QDialog::Accepted) {
         // Settings already saved by dialog
         // Update window title with new display name
         setWindowTitle(QString("ExoSend - %1").arg(m_settings->getDisplayName()));
@@ -367,6 +378,148 @@ void MainWindow::onExit()
 
         LogCrash("  onExit(deferred): dispatching QApplication::quit()");
         QApplication::quit();
+    });
+}
+
+void MainWindow::performFactoryReset(bool removeFirewallRules)
+{
+    if (!m_settings) {
+        QMessageBox::critical(this, "Internal Error", "Settings manager not initialized.");
+        return;
+    }
+
+    int active = 0;
+    int completed = 0;
+    if (m_transferModel) {
+        m_transferModel->getTransferCounts(active, completed);
+    }
+
+    if (active > 0) {
+        const QMessageBox::StandardButton response = QMessageBox::question(
+            this,
+            "Factory Reset",
+            QString("There %1 %2 active transfer%3.\n\n"
+                    "Factory Reset will cancel %4 and restart ExoSend.\n\n"
+                    "Continue?")
+                .arg(active == 1 ? "is" : "are")
+                .arg(active)
+                .arg(active == 1 ? "" : "s")
+                .arg(active == 1 ? "it" : "them"),
+            QMessageBox::Yes | QMessageBox::No,
+            QMessageBox::No
+        );
+        if (response != QMessageBox::Yes) {
+            return;
+        }
+    }
+
+    // Apply settings reset first. If saving fails, do not proceed with restart.
+    if (!m_settings->factoryResetKeepIdentity()) {
+        QMessageBox::critical(
+            this,
+            "Factory Reset Failed",
+            "Failed to reset and save settings.\n\n"
+            "No restart was performed."
+        );
+        return;
+    }
+
+    // Optionally remove firewall rules. This is best-effort.
+    if (removeFirewallRules) {
+        const QString helperPath = QCoreApplication::applicationDirPath() + "/ExoSendFirewallHelper.exe";
+        if (!QFileInfo::exists(helperPath)) {
+            QMessageBox::warning(
+                this,
+                "Firewall Helper Missing",
+                "ExoSendFirewallHelper.exe was not found next to ExoSend.exe.\n"
+                "Firewall rules were not removed."
+            );
+        } else {
+#ifdef _WIN32
+            SHELLEXECUTEINFOW sei{};
+            sei.cbSize = sizeof(sei);
+            sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+            sei.lpVerb = L"runas";
+
+            const std::wstring fileW = helperPath.toStdWString();
+            const std::wstring paramsW = L"--remove";
+            sei.lpFile = fileW.c_str();
+            sei.lpParameters = paramsW.c_str();
+            sei.nShow = SW_SHOWNORMAL;
+
+            if (!ShellExecuteExW(&sei) || !sei.hProcess) {
+                const DWORD err = GetLastError();
+                const QString details = (err == ERROR_CANCELLED)
+                    ? "Administrator approval was cancelled."
+                    : ("Win32 error code: " + QString::number(static_cast<qulonglong>(err)));
+
+                QMessageBox::warning(
+                    this,
+                    "Firewall Rules Not Removed",
+                    "Failed to start elevated firewall helper.\n\n" + details
+                );
+            } else {
+                (void)WaitForSingleObject(sei.hProcess, 60000);
+                DWORD exitCode = 0;
+                (void)GetExitCodeProcess(sei.hProcess, &exitCode);
+                CloseHandle(sei.hProcess);
+
+                if (exitCode != 0) {
+                    QMessageBox::warning(
+                        this,
+                        "Firewall Rules Not Removed",
+                        "The elevated firewall helper reported failure.\n"
+                        "Exit code: " + QString::number(static_cast<qulonglong>(exitCode))
+                    );
+                }
+            }
+#else
+            QMessageBox::information(
+                this,
+                "Not Supported",
+                "Automatic firewall configuration is only supported on Windows."
+            );
+#endif
+        }
+    }
+
+    // Start the relaunch helper so the restarted app begins only after this PID exits.
+    const QString relaunchPath = QCoreApplication::applicationDirPath() + "/ExoSendRelaunch.exe";
+    if (!QFileInfo::exists(relaunchPath)) {
+        QMessageBox::critical(
+            this,
+            "Restart Failed",
+            "ExoSendRelaunch.exe was not found next to ExoSend.exe.\n"
+            "Rebuild or reinstall, then retry Factory Reset."
+        );
+        return;
+    }
+
+    const DWORD pid = GetCurrentProcessId();
+    const QString launchPath = QDir::toNativeSeparators(QCoreApplication::applicationFilePath());
+    const QStringList args = QStringList()
+        << "--wait-pid" << QString::number(static_cast<qulonglong>(pid))
+        << "--launch" << launchPath;
+
+    if (!QProcess::startDetached(relaunchPath, args)) {
+        QMessageBox::critical(
+            this,
+            "Restart Failed",
+            "Failed to start ExoSendRelaunch.exe.\n"
+            "Factory Reset completed, but ExoSend could not restart automatically."
+        );
+        return;
+    }
+
+    // Hide the UI immediately so Windows doesn't show "Not Responding" while we
+    // join worker threads. Do the blocking shutdown on the next event-loop turn.
+    // (Similar to onExit().)
+    hide();
+    close();
+
+    QTimer::singleShot(0, this, [this]() {
+        stopServices();
+        QCoreApplication::quit();
     });
 }
 
@@ -674,7 +827,7 @@ void MainWindow::createMenuBar()
     m_aboutAction = helpMenu->addAction("&About ExoSend");
     connect(m_aboutAction, &QAction::triggered, [this]() {
         QMessageBox::about(this, "About ExoSend",
-                          "ExoSend v0.3.0\n\n"
+                          "ExoSend v0.3.1\n\n"
                           "Decentralized Local File Transfer\n"
                           "Built with Qt 6 and Modern C++\n\n"
                           "(c) 2026 ExoSend Project");
@@ -1049,7 +1202,7 @@ bool MainWindow::initializeServices()
                                     "This may indicate the peer was reinstalled, or a MITM attempt.\n\n"
                                     "Expected (pinned):\n" + expectedDisplay + "\n\n"
                                     "Actual (peer):\n" + fpDisplay + "\n\n"
-                                    "To restore trust, perform secure pairing again using a pairing code."
+                                    "To restore trust, perform secure pairing again using a pairing phrase."
                                 );
 
                                 ExoSend::ThreadSafeLog::log(
@@ -1071,7 +1224,7 @@ bool MainWindow::initializeServices()
                                 this,
                                 "Unpaired Peer",
                                 "Incoming transfer rejected because this peer is not paired yet.\n\n"
-                                "For maximum security, ExoSend requires secure pairing (pairing code + TLS channel binding) before accepting transfers.\n\n"
+                                "For security, ExoSend requires secure pairing (pairing phrase + TLS channel binding) before accepting transfers.\n\n"
                                 "Ask the sender to pair first, then retry the transfer."
                             );
 
@@ -1204,24 +1357,101 @@ bool MainWindow::initializeServices()
                     const QString serverFpDisplay = QString::fromStdString(
                         ExoSend::FingerprintUtils::formatForDisplay(qServerFp.toStdString()));
 
-                    bool ok = false;
-                    const QString codeQ = QInputDialog::getText(
-                        this,
-                        "Secure Pairing Request",
-                        "A peer is requesting secure pairing.\n\n"
-                        "Peer: " + displayName + "\n"
-                        "IP: " + qClientIp + "\n"
-                        "UUID: " + qClientUuid + "\n\n"
-                        "Peer certificate fingerprint (SHA-256):\n" + clientFpDisplay + "\n\n"
-                        "Local certificate fingerprint (SHA-256):\n" + serverFpDisplay + "\n\n"
-                        "Enter the secure pairing code shown on the other device:",
-                        QLineEdit::Normal,
-                        "",
-                        &ok
+                    std::array<uint8_t, 16> secret{};
+                    bool phraseAccepted = false;
+
+                    SecurePairingIncomingDialog dlg(
+                        displayName,
+                        qClientIp,
+                        qClientUuid,
+                        clientFpDisplay,
+                        serverFpDisplay,
+                        ExoSend::PAIRING_TIMEOUT_MS,
+                        this
                     );
 
-                    if (!ok) {
-                        *outErr = "User cancelled pairing";
+                    dlg.setValidateFn([&](const QString& userText, QString& outUserMsg, QString& outDetails) -> bool {
+                        std::array<std::string, 12> extracted{};
+                        std::string extractErr;
+                        if (!ExoSend::PairingPhraseExtract::extractSingleRfc1751Phrase(
+                                userText.toStdString(), extracted, extractErr)) {
+                            const bool ambiguous = (extractErr.find("Multiple phrases") != std::string::npos);
+                            outUserMsg = ambiguous
+                                ? QString("[%1] Ambiguous pairing phrase.")
+                                      .arg(ExoSend::ErrorCodes::PAIRING_AMBIGUOUS_PHRASE)
+                                : QString("[%1] Invalid pairing phrase.")
+                                      .arg(ExoSend::ErrorCodes::PAIRING_INVALID_PHRASE);
+                            outDetails = QString::fromStdString(extractErr);
+                            return false;
+                        }
+
+                        std::string decodeErr;
+                        if (!ExoSend::PairingPhrase::decodeRfc1751(extracted, secret, decodeErr)) {
+                            outUserMsg = QString("[%1] Invalid pairing phrase.")
+                                             .arg(ExoSend::ErrorCodes::PAIRING_INVALID_PHRASE);
+                            outDetails = QString::fromStdString(decodeErr);
+                            return false;
+                        }
+
+                        std::array<uint8_t, 32> confirmKey{};
+                        std::string confirmErr;
+                        if (!ExoSend::PairingConfirm::deriveConfirmKey(secret, tlsExporterChannelBinding, confirmKey, confirmErr)) {
+                            outUserMsg = QString("[%1] Failed to derive pairing key.")
+                                             .arg(ExoSend::ErrorCodes::PAIRING_INTERNAL_ERROR);
+                            outDetails = QString::fromStdString(confirmErr);
+                            return false;
+                        }
+
+                        if (!ExoSend::PairingConfirm::verifyTag(
+                                confirmKey,
+                                ExoSend::PairingRole::Client,
+                                qClientUuid.toStdString(),
+                                qClientFp.toStdString(),
+                                qServerUuid.toStdString(),
+                                qServerFp.toStdString(),
+                                clientTag,
+                                confirmErr)) {
+                            outUserMsg = QString("[%1] Pairing confirmation failed.")
+                                             .arg(ExoSend::ErrorCodes::PAIRING_PROTOCOL_ERROR);
+                            outDetails = QString::fromStdString(confirmErr);
+                            return false;
+                        }
+
+                        if (!ExoSend::PairingConfirm::computeTag(
+                                confirmKey,
+                                ExoSend::PairingRole::Server,
+                                qServerUuid.toStdString(),
+                                qServerFp.toStdString(),
+                                qClientUuid.toStdString(),
+                                qClientFp.toStdString(),
+                                *outTag,
+                                confirmErr)) {
+                            outUserMsg = QString("[%1] Failed to compute pairing response.")
+                                             .arg(ExoSend::ErrorCodes::PAIRING_INTERNAL_ERROR);
+                            outDetails = QString::fromStdString(confirmErr);
+                            return false;
+                        }
+
+                        // Pin after cryptographic confirmation succeeded.
+                        m_settings->pinPeerFingerprint(qClientUuid, qClientFp, displayName);
+                        m_settings->updatePeerSeen(qClientUuid, displayName);
+
+                        ExoSend::ThreadSafeLog::log(
+                            "TRUST_PIN peer=" + qClientUuid.toStdString() +
+                            " fp=" + qClientFp.toStdString().substr(0, 16) + "...");
+
+                        phraseAccepted = true;
+                        return true;
+                    });
+
+                    const int dlgResult = dlg.exec();
+                    if (dlgResult != QDialog::Accepted || !phraseAccepted) {
+                        if (dlg.timedOut()) {
+                            *outErr = std::string("[") + ExoSend::ErrorCodes::PAIRING_TIMED_OUT + "] Pairing timed out";
+                        } else {
+                            *outErr = std::string("[") + ExoSend::ErrorCodes::PAIRING_CANCELLED + "] User cancelled pairing";
+                        }
+
                         m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
                         {
                             std::lock_guard<std::mutex> lock(*cvMutex);
@@ -1232,92 +1462,7 @@ bool MainWindow::initializeServices()
                         return;
                     }
 
-                    std::array<uint8_t, 16> secret{};
-                    std::string parseErr;
-                    if (!ExoSend::PairingSecret::parse128Base32Crockford(codeQ.toStdString(), secret, parseErr)) {
-                        QMessageBox::warning(this, "Invalid Pairing Code",
-                                             "The pairing code is invalid.\n\n" + QString::fromStdString(parseErr));
-                        *outErr = parseErr;
-                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
-                        {
-                            std::lock_guard<std::mutex> lock(*cvMutex);
-                            *accepted = false;
-                            *ready = true;
-                        }
-                        cv->notify_one();
-                        return;
-                    }
-
-                    std::array<uint8_t, 32> confirmKey{};
-                    std::string confirmErr;
-                    if (!ExoSend::PairingConfirm::deriveConfirmKey(secret, tlsExporterChannelBinding, confirmKey, confirmErr)) {
-                        QMessageBox::critical(this, "Pairing Failed",
-                                              "Failed to derive pairing key.\n\n" + QString::fromStdString(confirmErr));
-                        *outErr = confirmErr;
-                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
-                        {
-                            std::lock_guard<std::mutex> lock(*cvMutex);
-                            *accepted = false;
-                            *ready = true;
-                        }
-                        cv->notify_one();
-                        return;
-                    }
-
-                    // Verify the client tag (computed by the requester).
-                    if (!ExoSend::PairingConfirm::verifyTag(
-                            confirmKey,
-                            ExoSend::PairingRole::Client,
-                            qClientUuid.toStdString(),
-                            qClientFp.toStdString(),
-                            qServerUuid.toStdString(),
-                            qServerFp.toStdString(),
-                            clientTag,
-                            confirmErr)) {
-                        QMessageBox::critical(this, "Pairing Failed",
-                                              "Pairing confirmation failed.\n\n" + QString::fromStdString(confirmErr));
-                        *outErr = confirmErr;
-                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
-                        {
-                            std::lock_guard<std::mutex> lock(*cvMutex);
-                            *accepted = false;
-                            *ready = true;
-                        }
-                        cv->notify_one();
-                        return;
-                    }
-
-                    // Compute the server response tag.
-                    if (!ExoSend::PairingConfirm::computeTag(
-                            confirmKey,
-                            ExoSend::PairingRole::Server,
-                            qServerUuid.toStdString(),
-                            qServerFp.toStdString(),
-                            qClientUuid.toStdString(),
-                            qClientFp.toStdString(),
-                            *outTag,
-                            confirmErr)) {
-                        QMessageBox::critical(this, "Pairing Failed",
-                                              "Failed to compute pairing response.\n\n" + QString::fromStdString(confirmErr));
-                        *outErr = confirmErr;
-                        m_pairingLimiter.endPrompt(qClientUuid.toStdString(), false);
-                        {
-                            std::lock_guard<std::mutex> lock(*cvMutex);
-                            *accepted = false;
-                            *ready = true;
-                        }
-                        cv->notify_one();
-                        return;
-                    }
-
-                    // Pin after cryptographic confirmation succeeded.
-                    m_settings->pinPeerFingerprint(qClientUuid, qClientFp, displayName);
-                    m_settings->updatePeerSeen(qClientUuid, displayName);
-
-                    ExoSend::ThreadSafeLog::log(
-                        "TRUST_PIN peer=" + qClientUuid.toStdString() +
-                        " fp=" + qClientFp.toStdString().substr(0, 16) + "...");
-
+                    *outErr = "";
                     m_pairingLimiter.endPrompt(qClientUuid.toStdString(), true);
                     {
                         std::lock_guard<std::mutex> lock(*cvMutex);
@@ -1330,8 +1475,10 @@ bool MainWindow::initializeServices()
             );
 
             std::unique_lock<std::mutex> lock(*cvMutex);
-            if (!cv->wait_for(lock, std::chrono::seconds(30), [&ready] { return *ready; })) {
-                errorMsg = "Pairing prompt timeout";
+            if (!cv->wait_for(lock,
+                              std::chrono::milliseconds(ExoSend::PAIRING_TIMEOUT_MS + 2000u),
+                              [&ready] { return *ready; })) {
+                errorMsg = "Pairing prompt timed out";
                 return false;
             }
 
@@ -1838,7 +1985,7 @@ void MainWindow::onFilesDropped(const QList<QUrl>& urls)
 
     QString pinnedFingerprint;
 
-    // Maximum-security model: require secure pairing (PAIR_REQ/PAIR_RESP) before first transfer.
+    // Secure pairing policy: require secure pairing (PAIR_REQ/PAIR_RESP) before first transfer.
     if (!m_settings) {
         QMessageBox::critical(this, "Internal Error", "Settings manager not initialized.");
         return;
@@ -1956,206 +2103,31 @@ bool MainWindow::pairPeerSecurely(
         return false;
     }
 
-    std::array<uint8_t, 16> generated{};
-    std::string genErr;
-    (void)ExoSend::PairingSecret::generate128(generated, genErr);
-    const QString defaultCode = QString::fromStdString(ExoSend::PairingSecret::toBase32Crockford(generated));
-
-    bool ok = false;
-    const QString codeQ = QInputDialog::getText(
-        this,
-        "Secure Pairing Code",
-        "Enter the secure pairing code.\n\n"
-        "For maximum security, this code must be shared out-of-band.\n"
-        "If you do not have one, use the pre-filled code and share it with the peer.\n\n"
-        "Click OK to start pairing now. The peer will be prompted to enter the same code.",
-        QLineEdit::Normal,
-        defaultCode,
-        &ok
-    );
-
-    if (!ok) {
+    SecurePairingOutgoingDialog dlg(peerUuid,
+                                   peerName,
+                                   peerIp,
+                                   peerPort,
+                                   localUuidQ,
+                                   ExoSend::PAIRING_TIMEOUT_MS,
+                                   this);
+    if (dlg.exec() != QDialog::Accepted) {
         return false;
     }
 
-    std::array<uint8_t, 16> secret{};
-    std::string parseErr;
-    if (!ExoSend::PairingSecret::parse128Base32Crockford(codeQ.toStdString(), secret, parseErr)) {
-        QMessageBox::warning(this, "Invalid Pairing Code",
-                             "The pairing code is invalid.\n\n" + QString::fromStdString(parseErr));
+    const QString peerFp = dlg.getPeerFingerprint();
+    if (peerFp.isEmpty()) {
+        QMessageBox::critical(this,
+                              "Pairing Failed",
+                              QString("[%1] Pairing succeeded but peer fingerprint is missing.")
+                                  .arg(ExoSend::ErrorCodes::PAIRING_INTERNAL_ERROR));
         return false;
     }
-
-    // Establish a TLS connection to the peer, then run PAIR_REQ/PAIR_RESP.
-    SOCKET sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == INVALID_SOCKET) {
-        QMessageBox::critical(this, "Pairing Failed",
-                              "socket() failed: " + QString::number(WSAGetLastError()));
-        return false;
-    }
-
-    const uint32_t timeoutMs = ExoSend::CONNECTION_TIMEOUT_MS;
-    if (!ExoSend::setSocketRecvTimeout(sock, timeoutMs)) {
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed", "Failed to set socket timeout.");
-        return false;
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(peerPort);
-    if (::inet_pton(AF_INET, peerIp.toStdString().c_str(), &addr.sin_addr) <= 0) {
-        closesocket(sock);
-        QMessageBox::warning(this, "Pairing Failed", "Invalid peer IP address.");
-        return false;
-    }
-
-    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR) {
-        const int wsaError = WSAGetLastError();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Failed to connect to peer.\n\n"
-                              "Peer: " + peerName + "\n"
-                              "IP: " + peerIp + "\n"
-                              "Port: " + QString::number(peerPort) + "\n\n"
-                              "WSAGetLastError(): " + QString::number(wsaError));
-        return false;
-    }
-
-    std::string tlsErr;
-    ExoSend::TlsSocket tls(sock, ExoSend::TlsRole::CLIENT);
-    if (!tls.handshake(tlsErr)) {
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "TLS handshake failed:\n\n" + QString::fromStdString(tlsErr));
-        return false;
-    }
-
-    ExoSend::TlsTransportStream stream(tls);
-
-    std::array<uint8_t, 32> exporter{};
-    if (!tls.getTlsExporterChannelBinding(exporter, tlsErr)) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Failed to compute TLS channel binding:\n\n" + QString::fromStdString(tlsErr));
-        return false;
-    }
-
-    std::string fpErr;
-    const std::string localFp = tls.getLocalFingerprint(fpErr);
-    const std::string peerFp = tls.getPeerFingerprint(fpErr);
-    if (localFp.empty() || peerFp.empty()) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Failed to obtain certificate fingerprints:\n\n" + QString::fromStdString(fpErr));
-        return false;
-    }
-
-    std::array<uint8_t, 32> confirmKey{};
-    std::string confirmErr;
-    if (!ExoSend::PairingConfirm::deriveConfirmKey(secret, exporter, confirmKey, confirmErr)) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Failed to derive pairing key:\n\n" + QString::fromStdString(confirmErr));
-        return false;
-    }
-
-    std::array<uint8_t, 32> clientTag{};
-    if (!ExoSend::PairingConfirm::computeTag(
-            confirmKey,
-            ExoSend::PairingRole::Client,
-            localUuid,
-            localFp,
-            peerUuidStd,
-            peerFp,
-            clientTag,
-            confirmErr)) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Failed to compute pairing tag:\n\n" + QString::fromStdString(confirmErr));
-        return false;
-    }
-
-    ExoSend::ExoHeader req(ExoSend::PacketType::PAIR_REQ, 0, "");
-    req.setSenderUuid(localUuid);
-    req.setSha256Bytes(clientTag.data());
-
-    std::vector<uint8_t> reqBuf(ExoSend::HEADER_SIZE);
-    (void)req.serializeToBuffer(reqBuf.data());
-
-    std::string ioErr;
-    if (!stream.sendExact(reqBuf.data(), reqBuf.size(), ioErr)) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Failed to send pairing request:\n\n" + QString::fromStdString(ioErr));
-        return false;
-    }
-
-    std::vector<uint8_t> respBuf(ExoSend::HEADER_SIZE);
-    if (!stream.recvExact(respBuf.data(), respBuf.size(), ioErr)) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Failed to receive pairing response:\n\n" + QString::fromStdString(ioErr));
-        return false;
-    }
-
-    ExoSend::ExoHeader resp;
-    if (!resp.deserializeFromBuffer(respBuf.data()) || !resp.isValid()) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed", "Invalid pairing response header.");
-        return false;
-    }
-
-    if (resp.getPacketType() != ExoSend::PacketType::PAIR_RESP) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::warning(this, "Pairing Rejected",
-                             "Peer rejected pairing (no response tag).");
-        return false;
-    }
-
-    if (resp.getSenderUuid() != peerUuidStd) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Peer identity mismatch during pairing.\n\n"
-                              "Expected UUID: " + peerUuid + "\n"
-                              "Actual UUID: " + QString::fromStdString(resp.getSenderUuid()));
-        return false;
-    }
-
-    const auto serverTag = resp.getSha256Bytes();
-    if (!ExoSend::PairingConfirm::verifyTag(
-            confirmKey,
-            ExoSend::PairingRole::Server,
-            peerUuidStd,
-            peerFp,
-            localUuid,
-            localFp,
-            serverTag,
-            confirmErr)) {
-        stream.shutdown();
-        closesocket(sock);
-        QMessageBox::critical(this, "Pairing Failed",
-                              "Pairing confirmation failed:\n\n" + QString::fromStdString(confirmErr));
-        return false;
-    }
-
-    stream.shutdown();
-    closesocket(sock);
 
     // Pin after cryptographic confirmation succeeded.
-    m_settings->pinPeerFingerprint(peerUuid, QString::fromStdString(peerFp), peerName);
+    m_settings->pinPeerFingerprint(peerUuid, peerFp, peerName);
     m_settings->updatePeerSeen(peerUuid, peerName);
 
-    outPinnedFingerprint = QString::fromStdString(peerFp);
+    outPinnedFingerprint = peerFp;
 
     ExoSend::ThreadSafeLog::log(
         "TRUST_PIN peer=" + peerUuidStd +

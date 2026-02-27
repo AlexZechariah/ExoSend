@@ -58,7 +58,7 @@ jobs:
         path: |
           ${{ env.VCPKG_ROOT }}/archives
           ${{ env.VCPKG_ROOT }}/downloads
-          build/release/vcpkg_installed
+          build/vcpkg_installed
         key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
         restore-keys: |
           ${{ runner.os }}-vcpkg-
@@ -124,26 +124,47 @@ jobs:
         "VCPKG_BINARY_SOURCES=clear;nugetconfig,$nugetConfigPath,$access;default,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # =========================================================================
-    # Setup MSVC
+    # Locate VsDevCmd (MSVC + Windows SDK environment)
     # =========================================================================
-    - name: Setup MSVC
-      uses: microsoft/setup-msbuild@v2
-      with:
-        msbuild-architecture: x64
+    - name: Locate VsDevCmd
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (-not (Test-Path $vswhere)) {
+          throw "vswhere.exe not found at '$vswhere'"
+        }
+
+        $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ([string]::IsNullOrWhiteSpace($installPath)) {
+          throw "vswhere.exe did not return a Visual Studio installation path with VC tools."
+        }
+
+        $vsDevCmd = Join-Path $installPath 'Common7\Tools\VsDevCmd.bat'
+        if (-not (Test-Path $vsDevCmd)) {
+          throw "VsDevCmd.bat not found at expected path: $vsDevCmd"
+        }
+
+        "VSDEVCMD=$vsDevCmd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # =========================================================================
     # Configure CMake
     # =========================================================================
     - name: Configure CMake
+      shell: cmd
       run: |
-        cmake --preset windows-release
+        call "%VSDEVCMD%" -no_logo -arch=x64 -host_arch=x64
+        set CC=cl
+        set CXX=cl
+        cmake --preset windows
 
     # =========================================================================
     # Validate Resolved Compiler/Toolchain
     # =========================================================================
     - name: Validate CMake Compiler and Toolchain
       run: |
-        $cachePath = "build/release/CMakeCache.txt"
+        $cachePath = "build/CMakeCache.txt"
         if (-not (Test-Path $cachePath)) {
           Write-Error "CMake cache not found at '$cachePath'. Configure step likely failed."
           exit 1
@@ -156,7 +177,7 @@ jobs:
         if ($compilerLine) {
           $compiler = $compilerLine.Line.Split('=', 2)[1]
         } else {
-          $compilerConfig = Get-ChildItem -Path "build/release/CMakeFiles" -Filter "CMakeCXXCompiler.cmake" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+          $compilerConfig = Get-ChildItem -Path "build/CMakeFiles" -Filter "CMakeCXXCompiler.cmake" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
           if ($compilerConfig) {
             $compilerSetLine = Select-String -Path $compilerConfig.FullName -Pattern '^set\(CMAKE_CXX_COMPILER \"(.+?)\"\)$' | Select-Object -First 1
             if ($compilerSetLine) {
@@ -194,16 +215,17 @@ jobs:
     # Build Project
     # =========================================================================
     - name: Build ExoSend
+      shell: cmd
       run: |
-        cmake --build build/release --config ${{ env.BUILD_CONFIGURATION }} --parallel
+        call "%VSDEVCMD%" -no_logo -arch=x64 -host_arch=x64
+        cmake --build build --config %BUILD_CONFIGURATION% --parallel
 
     # =========================================================================
     # Run Unit Tests
     # =========================================================================
     - name: Run Unit Tests
-      working-directory: build/release
       run: |
-        ctest -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
+        ctest --test-dir build -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
 
     # =========================================================================
     # Validate runtime deployment completeness
@@ -212,11 +234,12 @@ jobs:
       run: |
         $ErrorActionPreference = 'Stop'
 
-        $buildDir = "build/release/bin/${{ env.BUILD_CONFIGURATION }}"
+        $buildDir = "build/bin/${{ env.BUILD_CONFIGURATION }}"
         $required = @(
           (Join-Path $buildDir "ExoSend.exe"),
           (Join-Path $buildDir "ExoSendFirewallHelper.exe"),
           (Join-Path $buildDir "ExoSendReset.exe"),
+          (Join-Path $buildDir "ExoSendRelaunch.exe"),
           (Join-Path $buildDir "Qt6Core.dll"),
           (Join-Path $buildDir "Qt6Gui.dll"),
           (Join-Path $buildDir "Qt6Widgets.dll"),
@@ -246,7 +269,7 @@ jobs:
       run: |
         $ErrorActionPreference = 'Stop'
 
-        $buildDir = "build/release/bin/${{ env.BUILD_CONFIGURATION }}"
+        $buildDir = "build/bin/${{ env.BUILD_CONFIGURATION }}"
         $distDir = "dist"
         $stageDir = Join-Path $distDir "ExoSend"
         $zipPath = Join-Path $distDir "ExoSend.zip"
@@ -257,6 +280,7 @@ jobs:
         Copy-Item (Join-Path $buildDir "ExoSend.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "ExoSendFirewallHelper.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "ExoSendReset.exe") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "ExoSendRelaunch.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "*.dll") $stageDir -Force
         Copy-Item (Join-Path $buildDir "platforms") $stageDir -Recurse -Force
         Copy-Item (Join-Path $buildDir "styles") $stageDir -Recurse -Force

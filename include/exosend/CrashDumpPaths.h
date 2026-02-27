@@ -4,7 +4,7 @@
  *
  * Security rationale:
  * - Crash dumps may contain sensitive in-memory data.
- * - For maximum security, ExoSend stores crash artifacts only under the
+ * - For privacy and security, ExoSend stores crash artifacts only under the
  *   user-scoped LocalAppData directory, and applies ACL hardening to
  *   reduce accidental exposure to other local users.
  */
@@ -33,4 +33,3 @@ std::filesystem::path dumpFilePath(const std::string& timestamp, unsigned long p
 std::filesystem::path logFilePath(const std::string& timestamp, unsigned long pid);
 
 }  // namespace ExoSend::CrashDumpPaths
-

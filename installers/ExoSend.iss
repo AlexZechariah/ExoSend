@@ -7,7 +7,7 @@
 
 ; Application Information
 AppName=ExoSend
-AppVersion=0.3.0
+AppVersion=0.3.1
 AppPublisher=ExoSend Project
 AppPublisherURL=https://github.com/AlexZechariah/exosend
 AppSupportURL=https://github.com/AlexZechariah/exosend/issues
@@ -42,7 +42,7 @@ PrivilegesRequired=admin
 PrivilegesRequiredOverridesAllowed=dialog
 
 ; Build Information
-VersionInfoVersion=0.3.0.0
+VersionInfoVersion=0.3.1.0
 VersionInfoCompany=ExoSend Project
 VersionInfoDescription=ExoSend
 VersionInfoCopyright=Copyright (C) 2026
@@ -72,7 +72,7 @@ Name: "autostart"; Description: "Start ExoSend automatically when Windows starts
 ; ============================================================================
 ; Bundle entire deployed directory (windeployqt output)
 ; This includes: ExoSend.exe, all Qt DLLs, platform plugins, OpenSSL, ICU, etc.
-Source: "..\build\release\bin\Release\*"; DestDir: "{app}"; \
+Source: "..\build\bin\Release\*"; DestDir: "{app}"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
 
 ; Visual C++ Redistributable 2015-2022 (x64)
@@ -142,7 +142,7 @@ Root: HKLM; Subkey: "Software\Microsoft\Windows\CurrentVersion\Run"; ValueType: 
 
 ; Application Settings (Store installation path)
 Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "InstallPath"; ValueData: "{app}"; Flags: uninsdeletekey
-Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "Version"; ValueData: "0.3.0"; Flags: uninsdeletekey
+Root: HKLM; Subkey: "Software\ExoSend"; ValueType: string; ValueName: "Version"; ValueData: "0.3.1"; Flags: uninsdeletekey
 
 [Dirs]
 ; Create required directories (these should already exist from Files section, but ensuring them)
@@ -155,6 +155,41 @@ Name: "{app}\certs"
 // ============================================================================
 // Pascal Script Functions
 // ============================================================================
+
+var
+    RemoveUserData: Boolean;
+
+function CmdLineParamExists(const Value: string): Boolean;
+var
+    i: Integer;
+    Needle: string;
+begin
+    Needle := Uppercase(Value);
+    Result := False;
+    for i := 1 to ParamCount do
+    begin
+        if Uppercase(ParamStr(i)) = Needle then
+        begin
+            Result := True;
+            exit;
+        end;
+    end;
+end;
+
+function IsSilentUninstall: Boolean;
+begin
+    Result := CmdLineParamExists('/SILENT') or CmdLineParamExists('/VERYSILENT');
+end;
+
+function IsSafeUserDataPath(const RootPath: string; const Candidate: string): Boolean;
+var
+    RootNorm: string;
+    CandNorm: string;
+begin
+    RootNorm := AddBackslash(Uppercase(RootPath));
+    CandNorm := AddBackslash(Uppercase(Candidate));
+    Result := (RootNorm <> '\') and (CandNorm <> '\') and (Pos(RootNorm, CandNorm) = 1);
+end;
 
 // Visual C++ Redistributable Detection
 // Checks if VC++ 2015-2022 Redistributable (x64) is already installed
@@ -216,6 +251,8 @@ end;
 // Initialize uninstall - check if application is running
 function InitializeUninstall(): Boolean;
 begin
+    RemoveUserData := False;
+
     // Check if ExoSend is running
     if CheckForMutexes('ExoSendRunningMutex') then
     begin
@@ -238,6 +275,48 @@ begin
     begin
         Result := True;
     end;
+
+    if Result and (not IsSilentUninstall) then
+    begin
+        // Default: do NOT remove user data unless explicitly chosen.
+        RemoveUserData :=
+            (MsgBox('Also remove ExoSend user data (config, certs, logs, crash dumps)?' + #13#10 +
+                    '' + #13#10 +
+                    'If you choose Yes:' + #13#10 +
+                    '- ExoSend will behave like first run on next install (new UUID and TLS identity)' + #13#10 +
+                    '- All pairing/trust will be removed' + #13#10 +
+                    '' + #13#10 +
+                    'If you choose No:' + #13#10 +
+                    '- Settings and identity files remain on this machine',
+                    mbConfirmation, MB_YESNO or MB_DEFBUTTON2) = IDYES);
+    end;
+end;
+
+procedure CurUninstallStepChanged(CurUninstallStep: TUninstallStep);
+var
+    LocalAppData: string;
+    RoamingAppData: string;
+    PrimaryRoot: string;
+    LegacyQtRoot: string;
+    LegacyRoamingRoot: string;
+begin
+    if (CurUninstallStep <> usUninstall) or (not RemoveUserData) then
+        exit;
+
+    LocalAppData := ExpandConstant('{localappdata}');
+    RoamingAppData := ExpandConstant('{userappdata}');
+
+    PrimaryRoot := LocalAppData + '\ExoSend';
+    LegacyQtRoot := LocalAppData + '\ExoSend\ExoSend';
+    LegacyRoamingRoot := RoamingAppData + '\ExoSend';
+
+    // Guard against accidental deletion outside user profile roots.
+    if IsSafeUserDataPath(LocalAppData, PrimaryRoot) then
+        DelTree(PrimaryRoot, True, True, True);
+    if IsSafeUserDataPath(LocalAppData, LegacyQtRoot) then
+        DelTree(LegacyQtRoot, True, True, True);
+    if IsSafeUserDataPath(RoamingAppData, LegacyRoamingRoot) then
+        DelTree(LegacyRoamingRoot, True, True, True);
 end;
 
 // CurInstallProgressChanged callback (optional - for custom progress UI)

@@ -475,7 +475,8 @@ void TransferServer::handleClient(SOCKET clientSocket, const std::string& client
 
         if (!accepted) {
             uint8_t rejectBuffer[HEADER_SIZE];
-            ExoHeader rejectHeader(PacketType::REJECT, 0, "");
+            std::string reason = pairingErr.empty() ? "Pairing rejected" : pairingErr;
+            ExoHeader rejectHeader(PacketType::REJECT, 0, reason);
             (void)rejectHeader.serializeToBuffer(rejectBuffer);
             std::string rejectError;
             (void)stream.sendExact(rejectBuffer, HEADER_SIZE, rejectError);

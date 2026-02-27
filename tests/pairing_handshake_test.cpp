@@ -43,7 +43,7 @@ static std::string makeUniqueTempDir(const std::string& prefix) {
     const DWORD tid = GetCurrentThreadId();
     const auto dir = base / (prefix + "-" + std::to_string(pid) + "-" + std::to_string(tid));
     std::filesystem::create_directories(dir);
-    return dir.string();
+    return std::filesystem::canonical(dir).string();
 }
 
 static void setTestCertDirOrFail() {
@@ -223,4 +223,100 @@ TEST(PairingHandshakeTest, PairReqRespOverTlsVerifiesBothWays) {
     server.stop();
 
     EXPECT_TRUE(callbackCalled.load());
+}
+
+TEST(PairingHandshakeTest, PairRejectIncludesReasonInHeader) {
+    WsaGuard wsa;
+    ASSERT_EQ(wsa.rc, 0);
+
+    setTestCertDirOrFail();
+
+    const std::string serverUuid = "server-uuid-test";
+    const std::string clientUuid = "client-uuid-test";
+
+    const auto secret = fixedSecret();
+
+    TransferServer server(0);
+    server.setLocalDeviceUuid(serverUuid);
+
+    const std::string rejectReason = "User declined pairing";
+
+    server.setIncomingPairingCallback(
+        [&rejectReason](
+            const std::string& /*clientIp*/,
+            const std::string& /*reqClientUuid*/,
+            const std::string& /*reqClientFingerprint*/,
+            const std::string& /*reqServerUuid*/,
+            const std::string& /*reqServerFingerprint*/,
+            const std::array<uint8_t, 32>& /*exporter*/,
+            const std::array<uint8_t, 32>& /*clientTag*/,
+            std::array<uint8_t, 32>& /*outServerTag*/,
+            std::string& errorMsg
+        ) -> bool {
+            errorMsg = rejectReason;
+            return false;
+        }
+    );
+
+    ASSERT_TRUE(server.start());
+    const uint16_t port = server.getTcpPort();
+    ASSERT_NE(port, 0);
+
+    std::string connectErr;
+    SOCKET sock = connectLoopback(port, connectErr);
+    ASSERT_NE(sock, INVALID_SOCKET) << connectErr;
+
+    std::string tlsErr;
+    TlsSocket tls(sock, TlsRole::CLIENT);
+    ASSERT_TRUE(tls.handshake(tlsErr)) << tlsErr;
+    TlsTransportStream stream(tls);
+
+    std::array<uint8_t, 32> exporter{};
+    ASSERT_TRUE(tls.getTlsExporterChannelBinding(exporter, tlsErr)) << tlsErr;
+
+    std::string fpErr;
+    const std::string clientFp = tls.getLocalFingerprint(fpErr);
+    ASSERT_FALSE(clientFp.empty()) << fpErr;
+
+    const std::string serverFp = tls.getPeerFingerprint(fpErr);
+    ASSERT_FALSE(serverFp.empty()) << fpErr;
+
+    std::array<uint8_t, 32> key{};
+    ASSERT_TRUE(PairingConfirm::deriveConfirmKey(secret, exporter, key, tlsErr)) << tlsErr;
+
+    std::array<uint8_t, 32> clientTag{};
+    ASSERT_TRUE(PairingConfirm::computeTag(
+                    key,
+                    PairingRole::Client,
+                    clientUuid,
+                    clientFp,
+                    serverUuid,
+                    serverFp,
+                    clientTag,
+                    tlsErr)) << tlsErr;
+
+    ExoHeader req(PacketType::PAIR_REQ, 0, "");
+    req.setSenderUuid(clientUuid);
+    req.setSha256Bytes(clientTag.data());
+
+    std::vector<uint8_t> buf(HEADER_SIZE);
+    ASSERT_TRUE(req.serializeToBuffer(buf.data()));
+
+    std::string ioErr;
+    ASSERT_TRUE(stream.sendExact(buf.data(), buf.size(), ioErr)) << ioErr;
+
+    std::vector<uint8_t> respBuf(HEADER_SIZE);
+    ASSERT_TRUE(stream.recvExact(respBuf.data(), respBuf.size(), ioErr)) << ioErr;
+
+    ExoHeader resp;
+    ASSERT_TRUE(resp.deserializeFromBuffer(respBuf.data()));
+    ASSERT_TRUE(resp.isValid());
+    EXPECT_EQ(resp.getPacketType(), PacketType::REJECT);
+
+    EXPECT_NE(resp.getFilename().find(rejectReason), std::string::npos) << resp.getFilename();
+
+    stream.shutdown();
+    closeSocketIfValid(sock);
+
+    server.stop();
 }

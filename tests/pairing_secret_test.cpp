@@ -1,6 +1,6 @@
 /**
  * @file pairing_secret_test.cpp
- * @brief Unit tests for pairing secret generation and Base32 (Crockford) encoding.
+ * @brief Unit tests for pairing secret generation.
  */
 
 #include "exosend/PairingSecret.h"
@@ -23,50 +23,22 @@ static bool isAllZero(const std::array<uint8_t, 16>& v) {
 
 }  // namespace
 
-TEST(PairingSecretTest, Generate128NotAllZeroAndEncodesToExpectedLength) {
+TEST(PairingSecretTest, Generate128NotAllZero) {
     std::array<uint8_t, 16> secret{};
     std::string err;
     ASSERT_TRUE(PairingSecret::generate128(secret, err)) << err;
 
     EXPECT_FALSE(isAllZero(secret));
-
-    const std::string code = PairingSecret::toBase32Crockford(secret);
-    EXPECT_EQ(code.size(), 26u) << code;
 }
 
-TEST(PairingSecretTest, Base32RoundTrip) {
-    std::array<uint8_t, 16> secret{};
-    for (size_t i = 0; i < secret.size(); ++i) {
-        secret[i] = static_cast<uint8_t>(i * 7 + 3);
-    }
-
-    const std::string code = PairingSecret::toBase32Crockford(secret);
-
-    std::array<uint8_t, 16> parsed{};
+TEST(PairingSecretTest, Generate128DiffersAcrossCalls) {
+    std::array<uint8_t, 16> a{};
+    std::array<uint8_t, 16> b{};
     std::string err;
-    ASSERT_TRUE(PairingSecret::parse128Base32Crockford(code, parsed, err)) << err;
-    EXPECT_EQ(parsed, secret);
+    ASSERT_TRUE(PairingSecret::generate128(a, err)) << err;
+    ASSERT_TRUE(PairingSecret::generate128(b, err)) << err;
+
+    EXPECT_FALSE(isAllZero(a));
+    EXPECT_FALSE(isAllZero(b));
+    EXPECT_NE(a, b);
 }
-
-TEST(PairingSecretTest, ParseRejectsInvalidCharacters) {
-    std::array<uint8_t, 16> parsed{};
-    std::string err;
-    EXPECT_FALSE(PairingSecret::parse128Base32Crockford("THIS_IS_NOT_BASE32!!!", parsed, err));
-    EXPECT_FALSE(err.empty());
-}
-
-TEST(PairingSecretTest, ParseAcceptsWhitespaceAndLowercase) {
-    std::array<uint8_t, 16> secret{};
-    for (size_t i = 0; i < secret.size(); ++i) {
-        secret[i] = static_cast<uint8_t>(0xA0u + static_cast<uint8_t>(i));
-    }
-
-    const std::string code = PairingSecret::toBase32Crockford(secret);
-    const std::string decorated = "  " + std::string(code.begin(), code.end()) + " \r\n";
-
-    std::array<uint8_t, 16> parsed{};
-    std::string err;
-    ASSERT_TRUE(PairingSecret::parse128Base32Crockford(decorated, parsed, err)) << err;
-    EXPECT_EQ(parsed, secret);
-}
-

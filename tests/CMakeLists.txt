@@ -54,6 +54,72 @@ target_include_directories(hash_test
 gtest_discover_tests(hash_test)
 
 # ============================================================================
+# Test Executable: pairing_phrase_test
+# Tests RFC 1751 word phrase encoding/decoding for pairing secrets
+# ============================================================================
+add_executable(pairing_phrase_test
+    pairing_phrase_test.cpp
+)
+
+target_link_libraries(pairing_phrase_test
+    PRIVATE
+    exosend-core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+target_include_directories(pairing_phrase_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+gtest_discover_tests(pairing_phrase_test)
+
+# ============================================================================
+# Test Executable: pairing_phrase_extract_test
+# Tests strict extraction of a single RFC 1751 phrase from user-provided text
+# ============================================================================
+add_executable(pairing_phrase_extract_test
+    pairing_phrase_extract_test.cpp
+)
+
+target_link_libraries(pairing_phrase_extract_test
+    PRIVATE
+    exosend-core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+target_include_directories(pairing_phrase_extract_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+gtest_discover_tests(pairing_phrase_extract_test)
+
+# ============================================================================
+# Test Executable: relaunch_args_test
+# Tests strict parsing of ExoSendRelaunch arguments
+# ============================================================================
+add_executable(relaunch_args_test
+    relaunch_args_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/core/RelaunchArgs.cpp
+)
+
+target_link_libraries(relaunch_args_test
+    PRIVATE
+    GTest::gtest
+    GTest::gtest_main
+)
+
+target_include_directories(relaunch_args_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+gtest_discover_tests(relaunch_args_test)
+
+# ============================================================================
 # Test Executable: atomic_file_test
 # Tests atomic write helpers (temp file then rename)
 # ============================================================================
@@ -98,6 +164,35 @@ target_include_directories(json_test
 gtest_discover_tests(json_test)
 
 # ============================================================================
+# Test Executable: settings_factory_reset_test
+# Tests SettingsManager factory reset behavior (keep identity)
+# ============================================================================
+set(SETTINGS_FACTORY_RESET_MOC_HEADERS
+    ${CMAKE_SOURCE_DIR}/include/exosend/QtUi/SettingsManager.h
+)
+qt6_wrap_cpp(SETTINGS_FACTORY_RESET_MOC_SOURCES ${SETTINGS_FACTORY_RESET_MOC_HEADERS})
+
+add_executable(settings_factory_reset_test
+    settings_factory_reset_test.cpp
+    ${CMAKE_SOURCE_DIR}/src/gui/SettingsManager.cpp
+    ${SETTINGS_FACTORY_RESET_MOC_SOURCES}
+)
+
+target_link_libraries(settings_factory_reset_test
+    PRIVATE
+    Qt6::Core
+    exosend-core
+    GTest::gtest
+)
+
+target_include_directories(settings_factory_reset_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+gtest_discover_tests(settings_factory_reset_test)
+
+# ============================================================================
 # Test Executable: integration_test
 # Tests multi-NIC discovery, peer GC, file transfer, settings persistence
 # ============================================================================
@@ -119,6 +214,29 @@ target_include_directories(integration_test
 )
 
 gtest_discover_tests(integration_test)
+
+# ============================================================================
+# Test Executable: discovery_stop_smoke_test
+# Ensures DiscoveryService::stop() does not stall (shutdown reliability)
+# ============================================================================
+add_executable(discovery_stop_smoke_test
+    discovery_stop_smoke_test.cpp
+)
+
+target_link_libraries(discovery_stop_smoke_test
+    PRIVATE
+    exosend-core
+    GTest::gtest
+    GTest::gtest_main
+)
+
+target_include_directories(discovery_stop_smoke_test
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/include
+)
+
+# If this ever regresses into a hang, fail fast rather than stalling the suite.
+gtest_discover_tests(discovery_stop_smoke_test PROPERTIES TIMEOUT 10)
 
 # ============================================================================
 # Benchmark Tool: benchmark_tool
@@ -294,7 +412,7 @@ gtest_discover_tests(tls_exporter_test)
 
 # ============================================================================
 # Test Executable: pairing_secret_test
-# Tests pairing secret generation and Base32 encoding/decoding helpers
+# Tests pairing secret generation helpers
 # ============================================================================
 add_executable(pairing_secret_test
     pairing_secret_test.cpp
@@ -763,6 +881,29 @@ target_include_directories(dev_reset_args_test
 gtest_discover_tests(dev_reset_args_test)
 
 # ============================================================================
+# Tooling Gate: clangd compilation database verification
+# ============================================================================
+# This is a lightweight correctness gate for developer tooling. It ensures the
+# build directory contains a compilation database for clangd:
+# - build\compile_commands.json
+#
+# Note: This uses pwsh.exe (PowerShell 7).
+add_test(NAME tooling_clangd_verify
+    COMMAND pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command
+        "& { $ErrorActionPreference = 'Stop'; $cc = Join-Path '${CMAKE_SOURCE_DIR}' 'build\\compile_commands.json'; if (-not (Test-Path -LiteralPath $cc)) { throw \"Missing compilation database: $cc\" } }"
+)
+
+# ============================================================================
+# Tooling Gate: GitHub Actions workflow hygiene verification
+# ============================================================================
+# This is a lightweight correctness gate for CI files. It ensures we don't
+# regress to stale build directory/preset paths after refactors.
+add_test(NAME tooling_workflows_verify
+    COMMAND pwsh.exe -NoProfile -ExecutionPolicy Bypass -Command
+        "& { Set-StrictMode -Version Latest; $ErrorActionPreference = 'Stop'; $RepoRoot = '${CMAKE_SOURCE_DIR}'; $workflows = @((Join-Path $RepoRoot '.github\\workflows\\ci.yml'), (Join-Path $RepoRoot '.github\\workflows\\release.yml')); foreach ($path in $workflows) { if (-not (Test-Path -LiteralPath $path)) { throw \"Expected workflow file missing: $path\" } $text = Get-Content -LiteralPath $path -Raw; if ($text -match 'cmake\\s+--preset\\s+windows-release') { throw \"Workflow must not use removed preset: windows-release ($path)\" } if ($text -match 'build[\\\\/]+release') { throw \"Workflow must not reference deprecated build directory: build/release ($path)\" } if ($text -notmatch 'cmake\\s+--preset\\s+windows(\\s|$)') { throw \"Workflow must configure with: cmake --preset windows ($path)\" } if ($text -notmatch 'cmake\\s+--build\\s+build(\\s|$)') { throw \"Workflow must build with: cmake --build build ($path)\" } } }"
+)
+
+# ============================================================================
 # Test Summary
 # ============================================================================
 message(STATUS "")
@@ -792,7 +933,7 @@ message(STATUS "  benchmark_tool             - Performance benchmarking tool")
 message(STATUS "==================================================")
 message(STATUS "")
 message(STATUS "Run tests with:")
-message(STATUS "  ctest --test-dir ${CMAKE_BINARY_DIR} --config Release --verbose")
+message(STATUS "  ctest --test-dir ${CMAKE_BINARY_DIR} -C Release --verbose")
 message(STATUS "")
 message(STATUS "Or run individual tests:")
 message(STATUS "  ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}/protocol_test")

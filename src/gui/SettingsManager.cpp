@@ -263,6 +263,21 @@ void SettingsManager::clearAllPeers()
     saveSettings();
 }
 
+bool SettingsManager::factoryResetKeepIdentity()
+{
+    // Keep the device UUID stable. (Identity reset is an uninstall-only behavior.)
+    resetToDefaults();
+
+    // Clear pairing/pinning trust records.
+    m_trustStore.clear();
+
+    // Clear per-peer preferences.
+    m_autoAcceptPeers.clear();
+
+    emit settingsChanged();
+    return saveSettings();
+}
+
 ExoSend::TrustStore::Map SettingsManager::getTrustedPeers() const
 {
     return m_trustStore.records();

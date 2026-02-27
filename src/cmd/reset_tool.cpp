@@ -200,23 +200,23 @@ int main(int argc, char** argv)
     }
 #endif
 
-    const auto canonicalConfig = ExoSend::AppPaths::configJsonPath();
+    const auto primaryConfig = ExoSend::AppPaths::configJsonPath();
     const auto legacyQtConfig = ExoSend::AppPaths::legacyQtAppLocalConfigJsonPath();
 
-    const auto canonicalCerts = ExoSend::AppPaths::certsDir();
+    const auto primaryCerts = ExoSend::AppPaths::certsDir();
     const auto legacyRoamingCerts = ExoSend::AppPaths::legacyRoamingCertsDir();
 
     std::cout << "Dry run: " << (args.dryRun ? "true" : "false") << "\n";
-    std::cout << "Canonical config: " << canonicalConfig.u8string() << "\n";
+    std::cout << "Primary config:   " << primaryConfig.u8string() << "\n";
     std::cout << "Legacy config:    " << legacyQtConfig.u8string() << "\n";
-    std::cout << "Canonical certs:  " << canonicalCerts.u8string() << "\n";
+    std::cout << "Primary certs:    " << primaryCerts.u8string() << "\n";
     std::cout << "Legacy certs:     " << legacyRoamingCerts.u8string() << "\n";
 
     bool ok = true;
 
     if (args.wipeState) {
         std::string err;
-        ok = removePathBestEffort(canonicalConfig, false, args.dryRun, err) && ok;
+        ok = removePathBestEffort(primaryConfig, false, args.dryRun, err) && ok;
         if (!ok && !err.empty()) {
             std::cerr << err << "\n";
         }
@@ -228,7 +228,7 @@ int main(int argc, char** argv)
 
     if (args.wipeCerts) {
         std::string err;
-        ok = removePathBestEffort(canonicalCerts, true, args.dryRun, err) && ok;
+        ok = removePathBestEffort(primaryCerts, true, args.dryRun, err) && ok;
         if (!ok && !err.empty()) {
             std::cerr << err << "\n";
         }
@@ -264,4 +264,3 @@ int main(int argc, char** argv)
 
     return ok ? 0 : 3;
 }
-

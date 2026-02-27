@@ -180,6 +180,19 @@ public:
      */
     ExoSend::TrustStore::Map getTrustedPeers() const;
 
+    /**
+     * @brief Factory reset application settings and trust (keeps identity).
+     *
+     * This clears all trusted peers (pairing/pinning) and per-peer auto-accept
+     * preferences, and resets general settings to defaults. The device UUID and
+     * TLS certificate identity are not changed.
+     *
+     * The caller is responsible for restarting ExoSend if a full reset UX is desired.
+     *
+     * @return true if settings were saved successfully.
+     */
+    bool factoryResetKeepIdentity();
+
     // ========================================================================
     // Settings Mutators
     // ========================================================================

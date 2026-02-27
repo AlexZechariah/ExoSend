@@ -32,6 +32,9 @@ cmake_install.cmake
 vcpkg_installed/
 vcpkg/
 
+# Tooling scripts
+tools/
+
 # Log files
 *.log
 build_installer.log

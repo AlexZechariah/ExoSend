@@ -37,7 +37,6 @@ jobs:
     - name: Decide whether to publish
       id: decide
       env:
-        BEFORE_SHA: ${{ github.event.before }}
         REF: ${{ github.ref }}
         REF_NAME: ${{ github.ref_name }}
         SHA: ${{ github.sha }}
@@ -96,38 +95,28 @@ jobs:
         }
 
         # Auto-publish policy (branch push):
-        # - Only publish when version is 0.x.0 (patch == 0)
-        # - Only publish when the version changed in this push compared to the previous remote HEAD
-        # - Only publish when the tag does not already exist on the remote
-        $isEligibleVersion = ($current.Major -eq 0) -and ($current.Patch -eq 0)
+        #
+        # Publish when HEAD is an explicit release commit matching the version in
+        # CMakeLists.txt, and the corresponding tag does not already exist on the
+        # remote. Checking HEAD directly (rather than a BEFORE_SHA..SHA range)
+        # avoids failures when BEFORE_SHA is not reachable in the local clone.
 
-        $prevVersion = $null
-        $before = $env:BEFORE_SHA
-        if (-not [string]::IsNullOrWhiteSpace($before) -and ($before -notmatch '^0+$')) {
-          $prevCmake = (git show ($before + ":CMakeLists.txt")) 2>$null
-          if ($LASTEXITCODE -eq 0 -and -not [string]::IsNullOrWhiteSpace($prevCmake)) {
-            $prevParsed = Parse-VersionFromCMakeText $prevCmake
-            if ($prevParsed) {
-              $prevVersion = $prevParsed.Version
-            }
-          } else {
-            # Ensure a tolerated lookup failure cannot poison the step exit code.
-            $LASTEXITCODE = 0
-          }
+        $expectedReleaseSubject = "chore(release): v$($current.Version)"
+        $hasReleaseCommit = $false
+
+        $headSubject = (git log -1 --pretty=format:%s) 2>$null
+        if ($LASTEXITCODE -eq 0 -and $headSubject -eq $expectedReleaseSubject) {
+          $hasReleaseCommit = $true
+        } else {
+          $LASTEXITCODE = 0
         }
 
-        $versionChanged = $true
-        if ($prevVersion -and ($prevVersion -eq $current.Version)) {
-          $versionChanged = $false
-        }
-
-        $doRelease = $isEligibleVersion -and $versionChanged -and (-not $remoteTagExists)
+        $doRelease = $hasReleaseCommit -and (-not $remoteTagExists)
 
         Write-Host "Event: push to main"
         Write-Host "Current version: $($current.Version)"
-        Write-Host "Previous version: $prevVersion"
-        Write-Host "Eligible version (0.x.0): $isEligibleVersion"
-        Write-Host "Version changed in push: $versionChanged"
+        Write-Host "Expected release subject: $expectedReleaseSubject"
+        Write-Host "Release commit in push: $hasReleaseCommit"
         Write-Host "Remote tag exists ($tag): $remoteTagExists"
         Write-Host "Do release: $doRelease"
 
@@ -181,7 +170,7 @@ jobs:
         path: |
           ${{ env.VCPKG_ROOT }}/archives
           ${{ env.VCPKG_ROOT }}/downloads
-          build/release/vcpkg_installed
+          build/vcpkg_installed
         key: ${{ runner.os }}-vcpkg-${{ hashFiles('vcpkg.json') }}
         restore-keys: |
           ${{ runner.os }}-vcpkg-
@@ -240,34 +229,56 @@ jobs:
         "VCPKG_BINARY_SOURCES=clear;nugetconfig,$nugetConfigPath,readwrite;default,readwrite" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # =========================================================================
-    # Setup MSVC
+    # Locate VsDevCmd (MSVC + Windows SDK environment)
     # =========================================================================
-    - name: Setup MSVC
-      uses: microsoft/setup-msbuild@v2
-      with:
-        msbuild-architecture: x64
+    - name: Locate VsDevCmd
+      shell: pwsh
+      run: |
+        $ErrorActionPreference = 'Stop'
+
+        $vswhere = Join-Path ${env:ProgramFiles(x86)} 'Microsoft Visual Studio\Installer\vswhere.exe'
+        if (-not (Test-Path $vswhere)) {
+          throw "vswhere.exe not found at '$vswhere'"
+        }
+
+        $installPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+        if ([string]::IsNullOrWhiteSpace($installPath)) {
+          throw "vswhere.exe did not return a Visual Studio installation path with VC tools."
+        }
+
+        $vsDevCmd = Join-Path $installPath 'Common7\Tools\VsDevCmd.bat'
+        if (-not (Test-Path $vsDevCmd)) {
+          throw "VsDevCmd.bat not found at expected path: $vsDevCmd"
+        }
+
+        "VSDEVCMD=$vsDevCmd" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
     # =========================================================================
     # Configure CMake
     # =========================================================================
     - name: Configure CMake
+      shell: cmd
       run: |
-        cmake --preset windows-release
+        call "%VSDEVCMD%" -no_logo -arch=x64 -host_arch=x64
+        set CC=cl
+        set CXX=cl
+        cmake --preset windows
 
     # =========================================================================
     # Build Project
     # =========================================================================
     - name: Build ExoSend
+      shell: cmd
       run: |
-        cmake --build build/release --config ${{ env.BUILD_CONFIGURATION }} --parallel
+        call "%VSDEVCMD%" -no_logo -arch=x64 -host_arch=x64
+        cmake --build build --config %BUILD_CONFIGURATION% --parallel
 
     # =========================================================================
     # Run Unit Tests
     # =========================================================================
     - name: Run Unit Tests
-      working-directory: build/release
       run: |
-        ctest -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
+        ctest --test-dir build -C ${{ env.BUILD_CONFIGURATION }} --verbose --output-on-failure --no-tests=error
 
     # =========================================================================
     # Build Installer (Inno Setup)
@@ -299,7 +310,7 @@ jobs:
       run: |
         $ErrorActionPreference = 'Stop'
 
-        $buildDir = "build/release/bin/${{ env.BUILD_CONFIGURATION }}"
+        $buildDir = "build/bin/${{ env.BUILD_CONFIGURATION }}"
         $distDir = "dist"
         $stageDir = Join-Path $distDir "ExoSend"
         $zipPath = Join-Path $distDir "ExoSend.zip"
@@ -314,6 +325,7 @@ jobs:
         Copy-Item (Join-Path $buildDir "ExoSend.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "ExoSendFirewallHelper.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "ExoSendReset.exe") $stageDir -Force
+        Copy-Item (Join-Path $buildDir "ExoSendRelaunch.exe") $stageDir -Force
         Copy-Item (Join-Path $buildDir "*.dll") $stageDir -Force
         Copy-Item (Join-Path $buildDir "platforms") $stageDir -Recurse -Force
         Copy-Item (Join-Path $buildDir "styles") $stageDir -Recurse -Force
@@ -322,6 +334,7 @@ jobs:
           (Join-Path $stageDir "ExoSend.exe"),
           (Join-Path $stageDir "ExoSendFirewallHelper.exe"),
           (Join-Path $stageDir "ExoSendReset.exe"),
+          (Join-Path $stageDir "ExoSendRelaunch.exe"),
           (Join-Path $stageDir "Qt6Core.dll"),
           (Join-Path $stageDir "Qt6Gui.dll"),
           (Join-Path $stageDir "Qt6Widgets.dll"),
